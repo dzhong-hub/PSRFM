@@ -1,0 +1,63 @@
+PSRFM_PARAMETER_START
+# number of input pairs of fine and coarse resolution image
+  NUM_IN_PAIRS = 2
+# input coarse resolution data at the start and end dates (saved in 2 bytes (int16) / pixel)
+  IN_PAIR_COARSE_FNAME = E:\\PSRFMTest\\Input\\Matched_MODIS_BRDF_234_22-Aug-2018.dat E:\\PSRFMTest\\Input\\Matched_MODIS_BRDF_249_06-Sep-2018.dat
+# input fine resolution data at the start and end dates (saved in 2 bytes (int16) / pixel)
+  IN_PAIR_FINE_FNAME = E:\\PSRFMTest\\Input\\S2_L2A_234_22-Aug-2018.dat E:\\PSRFMTest\\Input\\S2_L2A_249_06-Sep-2018.dat
+# input cloud mask data for the fine resolution data at the start and end dates (saved in 1 bytes (int8) / pixel)
+  IN_PAIR_FINE_MASK_FNAME = E:\\PSRFMTest\\Temp\\start_mask_image.dat E:\\PSRFMTest\\Temp\\end_mask_image.dat
+# coarse resolution data list for prediction days, use a space to seperate file names
+  IN_PDAY_COARSE_FNAME = E:\\PSRFMTest\\Input\\Matched_MODIS_BRDF_235_23-Aug-2018.dat
+# the directory for output final predicted fine resolution images
+  OUT_PREDICTION_DIR = E:\\PSRFMTest\\Output
+# the directory for output temperary files such as the cluster image, the forward and backward predictions
+  OUT_TEMP_DIR = E:\\PSRFMTest\\Temp
+# the ENVI header file for the final predicted fine resolution images. This is required to map the geolocations.
+  OUT_ENVI_HDR = E:\\PSRFMTest\\Temp\\output_envi_header.hdr
+# option for co-registration (YES|NO)
+  CO_REGISTER = YES
+# number of rows of input fine and coarse images, for coregistration COARSE_ROWS > NROWS, otherwise they are equal
+  NROWS = 1400
+  COARSE_ROWS = 1600
+# number of columns of input fine and coarse images, for coregistration COARSE_COLS > NCOLS, otherwise they are equal
+  NCOLS = 2000
+  COARSE_COLS = 2200
+# number of bands (same for all inputs)
+  NBANDS = 6
+# spatial resolution (same for all inputs)
+  RESOLUTION = 20
+# resolution ratio of coarse and fine images
+  BLOCK_SIZE = 25
+# define data scale factor
+  SCALE_FACTOR = 10000
+# define metadata for fine resolution input
+  FINE_IMAGE_FILLV = -9999
+  FINE_IMAGE_DATA_RANGE = 0, 10000
+  FINE_IMAGE_UNCERTAINTY = 40
+# define metadata for coarse resolution input
+  COARSE_IMAGE_FILLV = 32767
+  COARSE_IMAGE_DATA_RANGE = 0, 10000
+  COARSE_IMAGE_UNCERTAINTY = 20
+# cluster method (KMEAN|CRATIO) and input data.
+# CLUSTER_METHOD = KMEAN: use the kmean method for clustering.
+# CLUSTER_METHOD = CRATIO: use the simple grouping method, only valid when CLUSTER_DATA = ratio
+  CLUSTER_METHOD = KMEAN
+# cluster method input data (fine|fine+coarse|ratio)
+# CLUSTER_DATA = fine: use the fine resolution image at the start or end date only
+# CLUSTER_DATA = fine+coarse: use the fine resolution image at the start or end date + the coarse resolution image
+# CLUSTER_DATA = ratio: use the coarse resolution reflectance change ratios
+  CLUSTER_DATA = fine
+# cluster range used for optimizating clusters
+  CLUSTER_RANGE = 8 20
+# cluster optimization method (CC|CF)
+  CLUSTER_OPTIMAL = CF
+# residual correction or adjustment method for abrupt land surface changes(none|bilinear)
+# RC_METHOD = none: don't apply the residual adjustment
+# RC_METHOD = bilinear: apply the residual adjustment based on a bilinear interpolation method
+  RC_METHOD = none
+# forward and backward merge method (temporal|uncertainty)
+# MERGE_METHOD = temporal: use elapsed time for weighting
+# MERGE_METHOD = uncertainty: use estimated uncertainty for weighting
+  MERGE_METHOD = temporal
+PSRFM_PARAMETER_END
