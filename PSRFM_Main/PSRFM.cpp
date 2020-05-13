@@ -76,31 +76,41 @@ string PSRFM::get_short_fine_sensor_name(string input_str) {
 
 
 
-void PSRFM::clean_memory(SENSOR_PAIR *sensor_p[], int PAIRS, CONTROL_PARAMETER *ctrl, SENSOR *pimage) {
+void PSRFM::clean_memory(SENSOR_PAIR *sensor_p[], int PAIRS, CONTROL_PARAMETER *ctrl, SENSOR_PAIR *observ_p[]) {
 
 	for (int p = 0; p < PAIRS; p++) {
 		for (int b = 0; b < ctrl->NUM_BANDS; b++) {
 			for (int r = 0; r < ctrl->NUM_ROWS; r++) {
 				delete[] sensor_p[p]->fimage.data[b][r];
 				delete[] sensor_p[p]->cimage.data[b][r];
+				delete[] sensor_p[p]->fimage.std[b][r];
+				delete[] sensor_p[p]->cimage.std[b][r];
 			}
 			delete[] sensor_p[p]->fimage.data[b];
 			delete[] sensor_p[p]->cimage.data[b];
+			delete[] sensor_p[p]->fimage.std[b];
+			delete[] sensor_p[p]->cimage.std[b];
 		}
 		delete[] sensor_p[p]->fimage.data;
 		delete[] sensor_p[p]->cimage.data;
+		delete[] sensor_p[p]->fimage.std;
+		delete[] sensor_p[p]->cimage.std;
 	}
 	for (int p = 0; p < PAIRS; p++) {
 		for (int r = 0; r < ctrl->NUM_ROWS; r++) {
 			delete[] sensor_p[p]->fimage.mask[r];
+			delete[] sensor_p[p]->fimage.cluster[r];
 		}
 		delete[] sensor_p[p]->fimage.mask;
+		delete[] sensor_p[p]->fimage.cluster;
 	}
-
-	delete ctrl;
-	delete[] pimage;
 	for (int p = 0; p < PAIRS; p++) {
 		delete sensor_p[p];
+	}
+
+	// delete observ_p
+	for (int p = 0; p < MAX_PREDICTIONS; p++) {
+		delete observ_p[p];
 	}
 }
 
@@ -163,6 +173,9 @@ void PSRFM::initialize_ctrl_parameters(CONTROL_PARAMETER *ctrl) {
 	ctrl->CLUSTER_DATA = "fine";
 	ctrl->CLUSTER_OPTIMAL = "CF";
 	ctrl->MERGE_METHOD = "temporal";
+	ctrl->MERGE_FINE_THRESHOLD = 500;
+	ctrl->MERGE_MASK_EXTEND = 3;
+	ctrl->NUM_CORES = omp_get_num_procs();
 }
 
 void PSRFM::initialize_sensors(SENSOR_PAIR *sensor_p[], int PAIRS) {
@@ -171,6 +184,8 @@ void PSRFM::initialize_sensors(SENSOR_PAIR *sensor_p[], int PAIRS) {
 
 		//fine
 		sensor_p[i]->fimage.fname = "";
+		sensor_p[i]->fimage.vfname = "";
+		sensor_p[i]->fimage.cfname = "";
 		sensor_p[i]->fimage.mfname = "";
 		sensor_p[i]->fimage.fillv = -9999;
 		sensor_p[i]->fimage.range[0] = 0;
@@ -181,6 +196,8 @@ void PSRFM::initialize_sensors(SENSOR_PAIR *sensor_p[], int PAIRS) {
 
 		//coarse 
 		sensor_p[i]->cimage.fname = "";
+		sensor_p[i]->cimage.vfname = "";
+		sensor_p[i]->cimage.cfname = "";
 		sensor_p[i]->cimage.mfname = "";
 		sensor_p[i]->cimage.fillv = -9999;
 		sensor_p[i]->cimage.range[0] = 0;
@@ -203,16 +220,17 @@ int PSRFM::read_image_data(SENSOR_PAIR *sensor_p[], CONTROL_PARAMETER *ctrl, int
 	short ***cdata;
 
 	string fname;
-	ifstream fdataFStream;  // fine data file
-	ifstream cdataFStream;	// coarse data file
-	ifstream mfdataFStream;	// fine mask data file
+	ifstream fdataFStream;		// fine data file
+	ifstream cdataFStream;		// coarse data file
+	ifstream mfdataFStream;		// fine mask data file
+	ifstream clusterFStream;	// cluster data file
+
+	ifstream fvarFStream;		// fine variance data file
+	ifstream cvarFStream;		// coarse variance data file
 
 	int num_bands;
 	int bandSize = ctrl->NUM_ROWS*ctrl->NUM_COLS;
 	int coarse_bandSize = ctrl->COARSE_ROWS*ctrl->COARSE_COLS;
-
-	int image_date_int = 0;
-	string image_date_str = "";
 
 	// allocate memory for co-registration
 	cdata = new short**[ctrl->NUM_BANDS];
@@ -286,6 +304,34 @@ int PSRFM::read_image_data(SENSOR_PAIR *sensor_p[], CONTROL_PARAMETER *ctrl, int
 		// read fine mask image data
 		for (i = 0; i < ctrl->NUM_ROWS; i++) {
 			mfdataFStream.read((char*)sensor_p[p]->fimage.mask[i], ctrl->NUM_COLS);
+		}
+
+		// cluster image data
+		fname = sensor_p[p]->fimage.cfname;
+		if (fname != "") {
+			clusterFStream.open(fname.c_str(), ios::in | ios::binary | ios::ate);
+
+			if (!clusterFStream.is_open()) {
+				cout << "Cannot open input image file " << fname.c_str() << endl;
+					return 1;
+			}
+			else { // read data
+				num_bands = (int)clusterFStream.tellg() * sizeof(char) / bandSize;
+				if (num_bands != 1) {
+					cout << "File not in correct dimension <" << fname.c_str() << ">" << endl;
+				}
+				else {
+					// move to start of input File
+					clusterFStream.seekg(0, ios_base::beg);
+				}
+			}
+			
+			// read cluster image data
+			for (i = 0; i < ctrl->NUM_ROWS; i++) {
+				clusterFStream.read((char*)sensor_p[p]->fimage.cluster[i], ctrl->NUM_COLS);
+			}
+
+			clusterFStream.close();
 		}
 
 		// read fine image data
@@ -363,10 +409,108 @@ int PSRFM::read_image_data(SENSOR_PAIR *sensor_p[], CONTROL_PARAMETER *ctrl, int
 		cdataFStream.close();
 		mfdataFStream.close();
 
-		cout << "Invalid pixels of all bands in fine image: " << inval_fpc << endl;
-		cout << "Invalid pixels of all bands in coarse image: " << inval_cpc << endl;
-		log_file << "Invalid pixels of all bands in fine image: " << inval_fpc << endl;
-		log_file << "Invalid pixels of all bands in coarse image: " << inval_cpc << endl;
+		// log input data file names
+		if (p == 0) {
+			cout << endl << "Fine image on start date: " << sensor_p[p]->fimage.fname << endl;
+			log_file << endl << "Fine image on start date: " << sensor_p[p]->fimage.fname << endl;
+			cout << "Coarse image on start date: " << sensor_p[p]->cimage.fname << endl;
+			log_file << "Coarse image on start date: " << sensor_p[p]->cimage.fname << endl;
+			cout << "Invalid pixels in fine image on start date: " << inval_fpc << endl;
+			cout << "Invalid pixels in coarse image on start date: " << inval_cpc << endl;
+			log_file << "Invalid pixels in fine image on start date: " << inval_fpc << endl;
+			log_file << "Invalid pixels in coarse image on start date: " << inval_cpc << endl << endl;
+		}
+		else {
+			cout << "Fine image on end date: " << sensor_p[p]->fimage.fname << endl;
+			log_file << "Fine image on end date: " << sensor_p[p]->fimage.fname << endl;
+			cout << "Coarse image on end date: " << sensor_p[p]->cimage.fname << endl;
+			log_file << "Coarse image on end date: " << sensor_p[p]->cimage.fname << endl;
+			cout << "Invalid pixels in fine image on end date: " << inval_fpc << endl;
+			cout << "Invalid pixels in coarse image on end date: " << inval_cpc << endl;
+			log_file << "Invalid pixels in fine image on end date: " << inval_fpc << endl;
+			log_file << "Invalid pixels in coarse image on end date: " << inval_cpc << endl << endl;
+		}
+
+
+
+		// initialize or read in std
+		// fine image std
+		fname = sensor_p[p]->fimage.vfname;
+		if (!fname.compare("")) {
+			// initialize fine variance data based on given uncertainty
+			for (b = 0; b < ctrl->NUM_BANDS; b++) {
+				for (i = 0; i < ctrl->NUM_ROWS; i++) {
+					for (j = 0; j < ctrl->NUM_COLS; j++) {
+						sensor_p[p]->fimage.std[b][i][j] = (unsigned short)(ctrl->f_error+0.5);
+					}
+				}
+			}
+		}
+		else {
+			fvarFStream.open(fname.c_str(), ios::in | ios::binary | ios::ate);
+
+			if (!fvarFStream.is_open()) {
+				cout << "Cannot open input image file " << fname.c_str() << endl;
+				return 1;
+			}
+			else { // read data
+				num_bands = (int)fvarFStream.tellg() * sizeof(char) / (2 * bandSize);
+				if (num_bands != ctrl->NUM_BANDS) {
+					cout << "File not in correct dimension <" << fname.c_str() << ">" << endl;
+				}
+				else {
+					// move to start of input File
+					fvarFStream.seekg(0, ios_base::beg);
+				}
+			}
+
+			// read fine variance data from file
+			for (b = 0; b < ctrl->NUM_BANDS; b++) {
+				for (i = 0; i < ctrl->NUM_ROWS; i++) {
+					fvarFStream.read((char*)sensor_p[p]->fimage.std[b][i], ctrl->NUM_COLS * 2);
+				}
+			}
+
+			fvarFStream.close();
+		}
+
+		// coarse image std
+		fname = sensor_p[p]->cimage.vfname;
+		if (!fname.compare("")) {
+			// initialize fine variance data based on given uncertainty
+			for (b = 0; b < ctrl->NUM_BANDS; b++) {
+				for (i = 0; i < ctrl->NUM_ROWS; i++) {
+					for (j = 0; j < ctrl->NUM_COLS; j++) {
+						sensor_p[p]->cimage.std[b][i][j] = (unsigned short)(ctrl->c_error + 0.5);
+					}
+				}
+			}
+		}
+		else {
+			cvarFStream.open(fname.c_str(), ios::in | ios::binary | ios::ate);
+
+			if (!cvarFStream.is_open()) {
+				cout << "Cannot open input image file " << fname.c_str() << endl;
+				return 1;
+			}
+			else { // read data
+				num_bands = (int)cvarFStream.tellg() * sizeof(char) / (2 * bandSize);
+				if (num_bands != ctrl->NUM_BANDS) {
+					cout << "File not in correct dimension <" << fname.c_str() << ">" << endl;
+				}
+				else {
+					// move to start of input File
+					cvarFStream.seekg(0, ios_base::beg);
+				}
+			}
+
+			// read coarse variance data from file
+			for (b = 0; b < ctrl->NUM_BANDS; b++) {
+				for (i = 0; i < ctrl->NUM_ROWS; i++) {
+					cvarFStream.read((char*)sensor_p[p]->cimage.std[b][i], ctrl->NUM_COLS * 2);
+				}
+			}
+		}
 	}
 
 	// free memory
@@ -464,8 +608,73 @@ int PSRFM::read_pimage_data(short ***pdata, string fname, CONTROL_PARAMETER *ctr
 	return 0;
 }
 
+int PSRFM::read_fimage_data(short ***fdata, string fname, unsigned char **mdata, string mfname, CONTROL_PARAMETER *ctrl) {
 
-int PSRFM::get_inputs(string ifname, SENSOR_PAIR *sensor_p[], string *pdata_fname, CONTROL_PARAMETER *ctrl, IMGAG_DATE_INFO *image_date_info, int PAIRS) {
+	int i;
+	int b;
+
+	ifstream fdataFStream;		// fine data file
+	ifstream mfdataFStream;		// fine mask data file
+
+	int num_bands;
+	int bandSize = ctrl->NUM_ROWS*ctrl->NUM_COLS;
+
+	// fine image data
+	fdataFStream.open(fname.c_str(), ios::in | ios::binary | ios::ate);
+
+	if (!fdataFStream.is_open()) {
+		cout << "Cannot open input image file " << fname.c_str() << endl;
+		return 1;
+	}
+	else { // read data
+		num_bands = (int)fdataFStream.tellg() * sizeof(char) / (2 * bandSize);
+		if (num_bands != ctrl->NUM_BANDS) {
+			cout << "File not in correct dimension <" << fname.c_str() << ">" << endl;
+		}
+		else {
+			// move to start of input File
+			fdataFStream.seekg(0, ios_base::beg);
+		}
+	}
+
+	// read fine image data
+	for (b = 0; b < ctrl->NUM_BANDS; b++) {
+		for (i = 0; i < ctrl->NUM_ROWS; i++) {
+			fdataFStream.read((char*)fdata[b][i], ctrl->NUM_COLS * 2);
+		}
+	}
+	
+	fdataFStream.close();
+
+	// read fine mask image data
+	mfdataFStream.open(mfname.c_str(), ios::in | ios::binary | ios::ate);
+
+	if (!mfdataFStream.is_open()) {
+		cout << "Cannot open input image file " << mfname.c_str() << endl;
+		return 1;
+	}
+	else { // read data
+		num_bands = (int)mfdataFStream.tellg() * sizeof(char) / bandSize;
+		if (num_bands != 1) {
+			cout << "File not in correct dimension <" << fname.c_str() << ">" << endl;
+		}
+		else {
+			// move to start of input File
+			mfdataFStream.seekg(0, ios_base::beg);
+		}
+	}
+
+	// read fine mask image data
+	for (i = 0; i < ctrl->NUM_ROWS; i++) {
+		mfdataFStream.read((char*)mdata[i], ctrl->NUM_COLS);
+	}
+
+	mfdataFStream.close();
+
+	return 0;
+}
+
+int PSRFM::get_inputs(string ifname, SENSOR_PAIR *sensor_p[], SENSOR_PAIR *observ_p[], CONTROL_PARAMETER *ctrl, IMGAG_DATE_INFO *image_date_info, int PAIRS) {
 
 	ifstream input;
 
@@ -477,8 +686,11 @@ int PSRFM::get_inputs(string ifname, SENSOR_PAIR *sensor_p[], string *pdata_fnam
 	vector<string> words;    // Create vector to hold our words
 
 	int wordsCount;
+	int num_pred;
 	int rowss;
 	int colss;
+	int merge_threshold;
+	int merge_extension;
 
 	input.open(ifname.c_str(), ios::in);
 
@@ -495,7 +707,7 @@ int PSRFM::get_inputs(string ifname, SENSOR_PAIR *sensor_p[], string *pdata_fnam
 			cout << line.c_str() << endl;
 		}
 		else if (!line.find("#")) {
-			cout << "Ignore... " << endl;
+			//cout << "Ignore ... " << line.c_str() << endl;
 		}
 		else {
 			istringstream iss(line);
@@ -507,7 +719,7 @@ int PSRFM::get_inputs(string ifname, SENSOR_PAIR *sensor_p[], string *pdata_fnam
 			wordsCount = static_cast<int>(words.size());
 
 			if (words[0] == "IN_PAIR_COARSE_FNAME") {
-				cout << "coarse images..." << endl;
+				cout << "coarse images ..." << endl;
 				for (i = 2; i < wordsCount; i++) {
 					sensor_p[i - 2]->cimage.fname = words[i];
 
@@ -518,7 +730,7 @@ int PSRFM::get_inputs(string ifname, SENSOR_PAIR *sensor_p[], string *pdata_fnam
 				}
 			}
 			else if (words[0] == "IN_PAIR_FINE_FNAME") {
-				cout << "fine images..." << endl;
+				cout << "fine images ..." << endl;
 				for (i = 2; i < wordsCount; i++) {
 					sensor_p[i - 2]->fimage.fname = words[i];
 
@@ -527,41 +739,81 @@ int PSRFM::get_inputs(string ifname, SENSOR_PAIR *sensor_p[], string *pdata_fnam
 					cout << "..." << words[i].c_str() << endl;
 				}
 			}
+			else if (words[0] == "IN_PAIR_CLUSTER_FNAME") {
+				cout << "cluster images ..." << endl;
+				if (words[2] != "NONE") {
+					for (i = 2; i < wordsCount; i++) {
+						sensor_p[i - 2]->fimage.cfname = words[i];
+						cout << "..." << words[i].c_str() << endl;
+					}
+				}
+			}
 			else if (words[0] == "IN_PAIR_FINE_MASK_FNAME") {
-				cout << "fine mask images..." << endl;
+				cout << "fine mask images ..." << endl;
 				for (i = 2; i < wordsCount; i++) {
 					sensor_p[i - 2]->fimage.mfname = words[i];
 					cout << "..." << words[i].c_str() << endl;
 				}
 			}
-			else if (words[0] == "IN_PDAY_COARSE_FNAME") {
-				cout << "Coarse image for prediction..." << endl;
-				ctrl->NUM_PREDICTIONS = wordsCount - 2;
+			else if (words[0] == "IN_PDAY_COARSE_NO") {
+				cout << "No of coarse images for prediction ..." << endl;
+				num_pred = stoi(words[2]);
+				ctrl->NUM_PREDICTIONS = num_pred;
+				cout << "..." << num_pred << endl;
 
-				for (i = 2; i < wordsCount; i++) {
+				cout << "Coarse image files for prediction ..." << endl;
+				for (int p = 0; p < num_pred; p++) {
+					getline(input, line);
+					istringstream iss(line);
+					words.clear();
+					while (iss >> word) {
+						words.push_back(word);
+					}
+					wordsCount = static_cast<int>(words.size());
 
-					pdata_fname[i - 2] = words[i];
-					int p = i - 2;
+					observ_p[p]->cimage.fname = words[0];
+					get_image_date_info(observ_p[p]->cimage.fname, &(image_date_info->pdt_date_num[p]), &(image_date_info->pdt_date[p]));
 
-					get_image_date_info(words[i], &(image_date_info->pdt_date_num[p]), &(image_date_info->pdt_date[p]));
+					observ_p[p]->cimage.date = image_date_info->pdt_date[p];
+					observ_p[p]->cimage.date_num = image_date_info->pdt_date_num[p];
 
-					cout << "..." << words[i].c_str() << endl;
+					cout << "..." << observ_p[p]->cimage.fname.c_str() << endl;
+
+					if (wordsCount == 2) {
+						observ_p[p]->fimage.fname = words[1];
+						observ_p[p]->fimage.date = image_date_info->pdt_date[p];
+						observ_p[p]->fimage.date_num = image_date_info->pdt_date_num[p];
+						cout << "..." << observ_p[p]->fimage.fname.c_str() << endl;
+					}
+					/* for now, we don't apply mask files to merge fine images on prediction dates
+					if (wordsCount == 3) {
+						observ_p[p]->fimage.fname = words[1];
+						observ_p[p]->fimage.mfname = words[2];
+						observ_p[p]->fimage.date = image_date_info->pdt_date[p];
+						observ_p[p]->fimage.date_num = image_date_info->pdt_date_num[p];
+						cout << "..." << observ_p[p]->fimage.fname.c_str() << endl;
+						cout << "..." << observ_p[p]->fimage.mfname.c_str() << endl;
+					}*/
 				}
 			}
 			else if (words[0] == "OUT_PREDICTION_DIR") {
-				cout << "OUTPUT_PREDICTION_DIR..." << endl;
+				cout << "OUTPUT_PREDICTION_DIR ..." << endl;
 				ctrl->OUTPUT_DIR = words[2];
 			}
 			else if (words[0] == "OUT_TEMP_DIR") {
-				cout << "OUTPUT_TEMP_DIR..." << endl;
+				cout << "OUTPUT_TEMP_DIR ..." << endl;
 				ctrl->TEMP_DIR = words[2];
 			}
 			else if (words[0] == "OUT_ENVI_HDR") {
-				cout << "OUTPUT_ENVI_HEDAER..." << endl;
+				cout << "OUTPUT_ENVI_HEDAER ..." << endl;
 				ctrl->ENVI_HDR = words[2];
 			}
+			else if (words[0] == "PREDICT_MODEL") {
+				cout << "PREDICT_MODEL ..." << endl;
+				ctrl->PREDICT_MODEL = words[2];
+			}
 			else if (words[0] == "CO_REGISTER") {
-				cout << "CO_REGISTER..." << endl;
+				cout << "CO_REGISTER ..." << endl;
 				ctrl->CO_REGISTER = words[2];
 			}
 			else if (words[0] == "NROWS") {
@@ -675,19 +927,41 @@ int PSRFM::get_inputs(string ifname, SENSOR_PAIR *sensor_p[], string *pdata_fnam
 				cout << ctrl->c_error << endl;
 			}
 			else if (words[0] == "CLUSTER_OPTIMAL") {
-				cout << "CLUSTER_OPTIMAL...";
+				cout << "CLUSTER_OPTIMAL ...";
 				ctrl->CLUSTER_OPTIMAL = words[2];
 				cout << ctrl->CLUSTER_OPTIMAL << endl;
 			}
+			else if (words[0] == "BIAS_METHOD") {
+			cout << "Systematic bias removal method ...";
+			ctrl->BIAS_METHOD = words[2];
+			cout << ctrl->BIAS_METHOD << endl;
+			}
 			else if (words[0] == "RC_METHOD") {
-			cout << "RC_METHOD...";
+			cout << "Residual correction method ...";
 			ctrl->RC_METHOD = words[2];
 			cout << ctrl->RC_METHOD << endl;
 			}
 			else if (words[0] == "MERGE_METHOD") {
-				cout << "MERGE_METHOD ...";
+				cout << "Fwd and bwd merge method ...";
 				ctrl->MERGE_METHOD = words[2];
 				cout << ctrl->MERGE_METHOD << endl;
+			}
+			else if (words[0] == "MERGE_FINE") {
+			cout << "Merge fine image on prediction date if available ...";
+			ctrl->MERGE_FINE = words[2];
+			cout << ctrl->MERGE_FINE << endl;
+			}
+			else if (words[0] == "MERGE_THRESHOLD") {
+			cout << "Merge fine image threshold ...";
+			merge_threshold = stoi(words[2]);
+			ctrl->MERGE_FINE_THRESHOLD = merge_threshold;
+			cout << ctrl->MERGE_FINE_THRESHOLD << endl;
+			}
+			else if (words[0] == "MERGE_EXTENSION") {
+			cout << "Merge fine mask extension ...";
+			merge_extension = stoi(words[2]);
+			ctrl->MERGE_MASK_EXTEND = merge_extension;
+			cout << ctrl->MERGE_MASK_EXTEND << endl;
 			}
 		}
 	}
@@ -698,13 +972,21 @@ int PSRFM::get_inputs(string ifname, SENSOR_PAIR *sensor_p[], string *pdata_fnam
 	for (int p = 0; p < PAIRS; p++) {
 		sensor_p[p]->fimage.data = new short**[ctrl->NUM_BANDS];
 		sensor_p[p]->cimage.data = new short**[ctrl->NUM_BANDS];
+		sensor_p[p]->fimage.std = new unsigned short**[ctrl->NUM_BANDS];
+		sensor_p[p]->cimage.std = new unsigned short**[ctrl->NUM_BANDS];
 		for (int b = 0; b < ctrl->NUM_BANDS; b++) {
 			sensor_p[p]->fimage.data[b] = new short*[ctrl->NUM_ROWS];
 			sensor_p[p]->cimage.data[b] = new short*[ctrl->NUM_ROWS];
+			sensor_p[p]->fimage.std[b] = new unsigned short*[ctrl->NUM_ROWS];
+			sensor_p[p]->cimage.std[b] = new unsigned short*[ctrl->NUM_ROWS];
+			sensor_p[p]->fimage.cluster = new unsigned char *[ctrl->NUM_ROWS];
 			sensor_p[p]->fimage.mask = new unsigned char *[ctrl->NUM_ROWS];
 			for (int r = 0; r < ctrl->NUM_ROWS; r++) {
 				sensor_p[p]->fimage.data[b][r] = new short[ctrl->NUM_COLS];
 				sensor_p[p]->cimage.data[b][r] = new short[ctrl->NUM_COLS];
+				sensor_p[p]->fimage.std[b][r] = new unsigned short[ctrl->NUM_COLS];
+				sensor_p[p]->cimage.std[b][r] = new unsigned short[ctrl->NUM_COLS];
+				sensor_p[p]->fimage.cluster[r] = new unsigned char[ctrl->NUM_COLS];
 				sensor_p[p]->fimage.mask[r] = new unsigned char[ctrl->NUM_COLS];
 			}
 		}
@@ -915,11 +1197,13 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 	double CC = 0.0;					// correlation at coarse scale of fine difference and coarse difference
 	double CF = 0.0;					// correlation at fine scale of fine difference and coarse difference
 	double RR = 0.0;
+	double MV = 0.0;
 	double Sigma = 0.0;
 
 	double sum_CC = 0.0;				// correlation at coarse scale of fine difference and coarse difference
 	double sum_CF = 0.0;				// correlation at fine scale of fine difference and coarse difference
 	double sum_RR = 0.0;
+	double sum_MV = 0.0;
 	double sum_Sigma = 0.0;
 
 	double CC2 = 0.0;					// correlation at coarse scale of fine difference and coarse difference
@@ -941,9 +1225,9 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 	float **fc_idata;
 	float **fc_pdata;
 
-	int tmp_count = 1;
+	int tmp_count = 0;
+	double tmp_sum = 0.0;
 	double RS2;
-	double RS2_sum = 0.0;
 	double RS2_ave = 0.0;
 
 	float **dcc;				// different coarse images at coarse resolution
@@ -1051,7 +1335,7 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 
 	// for OpenMP
 	// get number of cores and use all but minus 1
-	int numCores = omp_get_num_procs();
+	int numCores = omp_get_num_procs(); //ctrl->NUM_CORES
 	numCores--;
 
 	Eigen::initParallel();
@@ -1105,19 +1389,13 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 	VectorXf Eigenlv = VectorXf::Zero(mk);				// b
 	MatrixXf EigenA2 = MatrixXf::Zero(mk, k);			// weighted A
 	VectorXf Eigenlv2 = VectorXf::Zero(mk);				// weighted lv
-
-	//VectorXf EigenB = VectorXf::Zero(k);				// A'Pb
-
 	VectorXf Eigenfv = VectorXf::Zero(k);				// x
 	MatrixXf EigenPv = MatrixXf::Zero(mk, mk);			// weights
-
 	MatrixXf EigenNv = MatrixXf::Zero(k, k);			// k cluster number
 	MatrixXf EigenQv = MatrixXf::Zero(mk, mk);
 	MatrixXf EigenQvv = MatrixXf::Zero(mk, mk);
-	//MatrixXf EigenRv0 = MatrixXf::Zero(mk, mk);
 	MatrixXf EigenRv = MatrixXf::Zero(mk, mk);
 	MatrixXf EigenRvDiag = MatrixXf::Zero(mk, mk);
-
 	VectorXf Eigenvv = VectorXf::Zero(mk);
 
 	float sv2;
@@ -1129,78 +1407,96 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 
 	cluster_optimal_value_old = 1000000.0;				// cluster optimal value holder
 
-	// input data for clustering 
-	if (!ctrl->CLUSTER_DATA.compare("fine")) {			// fine image only
-		// copy the fine image data
-		for (b = 0; b < ctrl->NUM_BANDS; b++) {
-			for (int i = 0; i < ctrl->NUM_ROWS; i++) {
-				for (int j = 0; j < ctrl->NUM_COLS; j++) {
-					in_cluster_data[b][i][j] = short(sensor_p[im]->fimage.data[b][i][j]);
-				}
-
-			}
-		}
-		in_cluster_data_band = ctrl->NUM_BANDS;
-	}
-	else if (!ctrl->CLUSTER_DATA.compare("fine+coarse")) {	// fine + coarse image	
-		// copy the fine image data
-		for (b = 0; b < ctrl->NUM_BANDS; b++) {
-			for (int i = 0; i < ctrl->NUM_ROWS; i++) {
-				for (int j = 0; j < ctrl->NUM_COLS; j++) {
-					in_cluster_data[b][i][j] = short(sensor_p[im]->fimage.data[b][i][j]);
-				}
-
-			}
-		}
-		// append the coarse image data at prediction date
-		for (b = 0; b < ctrl->NUM_BANDS; b++) {
-			for (int i = 0; i < ctrl->NUM_ROWS; i++) {
-				for (int j = 0; j < ctrl->NUM_COLS; j++) {
-					in_cluster_data[b + ctrl->NUM_BANDS][i][j] = short(pimage[b][i][j]);
-				}
-
-			}
-		}
-		in_cluster_data_band = ctrl->NUM_BANDS*2;
-	}
-	else if (!ctrl->CLUSTER_DATA.compare("ratio")) {
-		// derive the change ratios
-		for (b = 0; b < ctrl->NUM_BANDS; b++) {
-			for (int i = 0; i < ctrl->NUM_ROWS; i++) {
-				for (int j = 0; j < ctrl->NUM_COLS; j++) {
-					// deal with invalid pixels
-					if (pimage[b][i][j] == ctrl->INVALID ||
-						sensor_p[im]->cimage.data[b][i][j] == ctrl->INVALID ||
-						sensor_p[im]->cimage.data[b][i][j] == 0) {
-						in_cluster_data[b][i][j] = ctrl->INVALID;
+	// input data for clustering
+	if (ctrl->CLUSTER_METHOD.compare("DONE")) {			// if clustering is needed
+		if (!ctrl->CLUSTER_DATA.compare("fine")) {		// fine image only
+			// copy the fine image data
+			for (b = 0; b < ctrl->NUM_BANDS; b++) {
+				for (int i = 0; i < ctrl->NUM_ROWS; i++) {
+					for (int j = 0; j < ctrl->NUM_COLS; j++) {
+						in_cluster_data[b][i][j] = short(sensor_p[im]->fimage.data[b][i][j]);
 					}
-					else {
-						in_cluster_data[b][i][j] = short((pimage[b][i][j] - sensor_p[im]->cimage.data[b][i][j]) * sensor_p[im]->cimage.scale / sensor_p[im]->cimage.data[b][i][j]);
-					}
-				}
 
-			}
-		}
-		in_cluster_data_band = ctrl->NUM_BANDS;
-	}
-
-	// set the first band pixel of the in_cluster_data to invalid if any one band is invalid
-	// to save loop time for the clustering method KMEAN	
-	if (!ctrl->CLUSTER_METHOD.compare("KMEAN")) {
-		for (b = 0; b < in_cluster_data_band; b++) {
-			for (int i = 0; i < ctrl->NUM_ROWS; i++) {
-				for (int j = 0; j < ctrl->NUM_COLS; j++) {
-					if (in_cluster_data[b][i][j] == ctrl->INVALID) {
-						in_cluster_data[0][i][j] = ctrl->INVALID;
-						inval_count++;
-						break;
-					}
 				}
 			}
+			in_cluster_data_band = ctrl->NUM_BANDS;
+		}
+		else if (!ctrl->CLUSTER_DATA.compare("fine+coarse")) {	// fine + coarse image	
+			// copy the fine image data
+			for (b = 0; b < ctrl->NUM_BANDS; b++) {
+				for (int i = 0; i < ctrl->NUM_ROWS; i++) {
+					for (int j = 0; j < ctrl->NUM_COLS; j++) {
+						in_cluster_data[b][i][j] = short(sensor_p[im]->fimage.data[b][i][j]);
+					}
+
+				}
+			}
+			// append the coarse image data at prediction date
+			for (b = 0; b < ctrl->NUM_BANDS; b++) {
+				for (int i = 0; i < ctrl->NUM_ROWS; i++) {
+					for (int j = 0; j < ctrl->NUM_COLS; j++) {
+						in_cluster_data[b + ctrl->NUM_BANDS][i][j] = short(pimage[b][i][j]);
+					}
+
+				}
+			}
+			in_cluster_data_band = ctrl->NUM_BANDS * 2;
+		}
+		else if (!ctrl->CLUSTER_DATA.compare("ratio")) {
+			// derive the change ratios
+			for (b = 0; b < ctrl->NUM_BANDS; b++) {
+				for (int i = 0; i < ctrl->NUM_ROWS; i++) {
+					for (int j = 0; j < ctrl->NUM_COLS; j++) {
+						// deal with invalid pixels
+						if (pimage[b][i][j] == ctrl->INVALID ||
+							sensor_p[im]->cimage.data[b][i][j] == ctrl->INVALID ||
+							sensor_p[im]->cimage.data[b][i][j] == 0) {
+							in_cluster_data[b][i][j] = ctrl->INVALID;
+						}
+						else {
+							in_cluster_data[b][i][j] = short((pimage[b][i][j] - sensor_p[im]->cimage.data[b][i][j]) * sensor_p[im]->cimage.scale / sensor_p[im]->cimage.data[b][i][j]);
+						}
+					}
+
+				}
+			}
+			in_cluster_data_band = ctrl->NUM_BANDS;
+		}
+
+		// set the first band pixel of the in_cluster_data to invalid if any one band is invalid
+		// to save loop time for the clustering method KMEAN	
+		if (!ctrl->CLUSTER_METHOD.compare("KMEAN")) {
+			for (b = 0; b < in_cluster_data_band; b++) {
+				for (int i = 0; i < ctrl->NUM_ROWS; i++) {
+					for (int j = 0; j < ctrl->NUM_COLS; j++) {
+						if (in_cluster_data[b][i][j] == ctrl->INVALID) {
+							in_cluster_data[0][i][j] = ctrl->INVALID;
+							inval_count++;
+							break;
+						}
+					}
+				}
+			}
 		}
 	}
+	else {
+		// apply the input cluster images
+		int k = 0;
+		for (int i = 0; i < ctrl->NUM_ROWS; i++) {
+			for (int j = 0; j < ctrl->NUM_COLS; j++) {
+				if (sensor_p[im]->fimage.cluster[i][j] > k) {
+					k = sensor_p[im]->fimage.cluster[i][j];
+				}
+			}
+		}
+		k = k + 1;
+		
+		// Fix the cluster number to the input clusters 
+		ctrl->CLUSTER_RANGE[0] = k;
+		ctrl->CLUSTER_RANGE[1] = k;
+	}
 
-	// for clusters 
+	// for optimization of cluster number 
 	for (k = ctrl->CLUSTER_RANGE[0]; k <= ctrl->CLUSTER_RANGE[1]; k++) {
 	
 		cout << endl << "Cluster No: " << k << endl;
@@ -1209,13 +1505,13 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 		sum_CC = 0.0;
 		sum_CF = 0.0;
 		sum_RR = 0.0;
+		sum_MV = 0.0;
 		sum_Sigma = 0.0;
 
 		EigenA.resize(Eigen::NoChange, k);			
 		EigenA2.resize(Eigen::NoChange, k);			
 		Eigenfv.resize(k);							
 		EigenNv.resize(k, k);
-		//EigenB.resize(k);
 
 		A = new float *[mk];
 		for (int ik = 0; ik < mk; ik++) {
@@ -1227,43 +1523,29 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 		for (b = 0; b < ctrl->NUM_BANDS; b++) {
 		
 			// clustering 
-			if (!ctrl->CLUSTER_METHOD.compare("KMEAN") && !cluster_done) {		// kemen using all the bands for clustering
-				if (!ctrl->CLUSTER_DATA.compare("fine+coarse")) {	// fine + coarse image
-					KMeans(in_cluster_data, iClusters, k, ctrl->NUM_BANDS*2, ctrl->NUM_ROWS, ctrl->NUM_COLS, ctrl->ITERATIONS, ctrl->MAX_DIFF_THRESHOLD, ctrl->INVALID);
-				}
-				else {
-					KMeans(in_cluster_data, iClusters, k, ctrl->NUM_BANDS, ctrl->NUM_ROWS, ctrl->NUM_COLS, ctrl->ITERATIONS, ctrl->MAX_DIFF_THRESHOLD, ctrl->INVALID);
-				}
-				
-				cluster_done = true;
-
-			}
-			else if (!ctrl->CLUSTER_METHOD.compare("CRATIO")) {  // simple clustering using change ratio of single band
-				CRatio(in_cluster_data, iClusters, k, b, ctrl->NUM_ROWS, ctrl->NUM_COLS, ctrl->INVALID);
-			}
-			
-			/*
-			// build observation equations, the following code was replaced by calling the function build_equations()
-			block_mean(sensor_p[im]->cimage.data[b], cc_idata, pimage[b], cc_pdata, ctrl->NUM_ROWS, ctrl->NUM_COLS, BLOCK_ROWS, BLOCK_COLS, ctrl->INVALID);
-			// get the cluster percetage within a coarse resolution pixel -- A is the output
-			mk = area_fraction(iClusters, k, ctrl->NUM_ROWS, ctrl->NUM_COLS, ctrl->BLOCK_SIZE, A);
-			// derive the change rate 
-			int ii = 0;
-			for (int i = 0; i < ORG_C_ROWS; i++) {
-				for (int j = 0; j < ORG_C_COLS; j++) {
-					// deal with invalid pixels
-					if (cc_pdata[i][j] == ctrl->INVALID || cc_idata[i][j] == ctrl->INVALID) {
-						cc_refl_change[ii] = 0;
+			if (ctrl->CLUSTER_METHOD.compare("DONE")) {
+				if (!ctrl->CLUSTER_METHOD.compare("KMEAN") && !cluster_done) {		// kemen using all the bands for clustering
+					if (!ctrl->CLUSTER_DATA.compare("fine+coarse")) {	// fine + coarse image
+						KMeans(in_cluster_data, iClusters, ctrl, k, ctrl->NUM_BANDS * 2);
 					}
 					else {
-						cc_refl_change[ii] = (cc_pdata[i][j] - cc_idata[i][j]) / dt;
+						KMeans(in_cluster_data, iClusters, ctrl, k, ctrl->NUM_BANDS);
 					}
-					ii++;
+
+					cluster_done = true;
+
+				}
+				else if (!ctrl->CLUSTER_METHOD.compare("CRATIO")) {  // simple clustering using change ratio of single band
+					CRatio(in_cluster_data, iClusters, k, b, ctrl->NUM_ROWS, ctrl->NUM_COLS, ctrl->INVALID);
 				}
 			}
-			*/
+			else {
+				iClusters = sensor_p[im]->fimage.cluster;
+				cluster_done = true;
+			}
 
 			mk = build_equations(sensor_p[im]->cimage.data[b], cc_idata, pimage[b], cc_pdata, iClusters, A, cc_refl_change, dt, k, ctrl);
+			// cout << "B=" << b << " L=" << cc_refl_change[0] << " " << cc_refl_change[1] << " " << cc_refl_change[2] << " " << cc_refl_change[3] << " " << cc_refl_change[4] << " " << cc_refl_change[5] << endl;
 
 			// for weight based on uncertainty input for linear system equations
 			double wu = sqrt(2.0)*ctrl->c_error / dt;
@@ -1287,7 +1569,8 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 
 			// EIGEN method to solve linear systems of equations
 			Eigenfv = EigenA2.bdcSvd(ComputeThinU | ComputeThinV).solve(Eigenlv2);
-			EigenNv.noalias() = EigenA.transpose() * EigenPv * EigenA;
+			//EigenNv.noalias() = EigenA.transpose() * EigenPv * EigenA;
+			EigenNv = EigenA.transpose() * EigenPv * EigenA;
 			EigenQv = EigenNv.inverse();
 
 			//EigenNv.noalias() = EigenA.transpose() * EigenA2;
@@ -1303,44 +1586,54 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 			Eigenvv = EigenA * Eigenfv - Eigenlv;			// vv
 			EigenRvDiag = EigenRv.diagonal();
 			rv = EigenRvDiag.sum();							// rv
-
 			sv2 = Eigenvv.transpose()*EigenPv*Eigenvv;
 			sv2 = sv2 / rv;									// sv2
 			Sigma = sqrt(sv2);
 			sum_Sigma += Sigma;
-
 			EigenQvv = sv2 * EigenQv;						// Qvv
 
-
 			// get the predicted image and its uncertainty
+			MV = 0.0;
+			tmp_sum = 0.0; 
+			tmp_count = 0;
 			for (int i = 0; i < ctrl->NUM_ROWS; i++) {
 				for (int j = 0; j < ctrl->NUM_COLS; j++) {
 					// deal with invalid pixels
-					if (sensor_p[im]->fimage.data[b][i][j] == ctrl->INVALID || iClusters[i][j] > k-1) {	// cluster k+1 is used for invalid pixels
-						blend_output[b][i][j] = short(ctrl->INVALID); // short(sensor_p[im]->fimage.fillv);
+					if (sensor_p[im]->fimage.data[b][i][j] == ctrl->INVALID || iClusters[i][j] > k-1) {	// cluster k is used for invalid pixels
+					//if (sensor_p[im]->fimage.data[b][i][j] == ctrl->INVALID) {
+						blend_output[b][i][j] = short(ctrl->INVALID); 
 						blend_uncertainty[b][i][j] = short(ctrl->INVALID);
 					}
 					else {
-						short predict = short(sensor_p[im]->fimage.data[b][i][j] + dt * Eigenfv(iClusters[i][j]));
-						if (predict < 0 || predict > sensor_p[im]->fimage.scale) {
+						short predict = sensor_p[im]->fimage.data[b][i][j] + short(dt * Eigenfv(iClusters[i][j]));
+						if (predict < 0 || predict > sensor_p[im]->fimage.scale) {		// the predicted value is negative or exceeds the valid range
+							//blend_output[b][i][j] = short(ctrl->INVALID);				// treat it as invalid
+							//blend_uncertainty[b][i][j] = short(ctrl->INVALID);
 							blend_output[b][i][j] = sensor_p[im]->fimage.data[b][i][j];
-							blend_uncertainty[b][i][j] = short(ctrl->f_error*ctrl->f_error);
+							blend_uncertainty[b][i][j] = sensor_p[im]->fimage.std[b][i][j]*sensor_p[im]->fimage.std[b][i][j]; // short(ctrl->f_error*ctrl->f_error);
 						}
 						else {
 							blend_output[b][i][j] = predict;
-							blend_uncertainty[b][i][j] = short(ctrl->f_error*ctrl->f_error + dt * dt*EigenQvv(iClusters[i][j], iClusters[i][j]));
+							blend_uncertainty[b][i][j] = sensor_p[im]->fimage.std[b][i][j]*sensor_p[im]->fimage.std[b][i][j] + short(dt * dt*EigenQvv(iClusters[i][j], iClusters[i][j]));
+							MV = sqrt(double(blend_uncertainty[b][i][j]));
+							if (is_valid(MV)) {
+								tmp_sum += MV;
+								tmp_count++;
+							}
 						}
 					}
 				}				
 			}
+			// nean uncertainty
+			// cout << "tmp_sum = " << tmp_sum << "tem_count = " << tmp_count << endl;
+			MV = tmp_sum / tmp_count;
+			sum_MV += MV;
 
 			// residual & correlation analysis
-
 			block_mean(sensor_p[im]->fimage.data[b], fc_idata, blend_output[b], fc_pdata, ctrl->NUM_ROWS, ctrl->NUM_COLS, BLOCK_ROWS, BLOCK_COLS, ctrl->INVALID);
 
-			tmp_count = 1;
-			RS2_ave = 0.0;
-			RS2_sum = 0.0;
+			tmp_sum = 0.0;
+			tmp_count = 0;			
 			for (int ii = 0; ii < ORG_C_ROWS; ii++) {
 				for (int jj = 0; jj < ORG_C_COLS; jj++) {					
 					// coarse image difference (input and the input for prediction) in coarse resolution
@@ -1362,17 +1655,16 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 						rs[ii][jj] = float(ctrl->INVALID);
 					}
 					else {
-						rs[ii][jj] = dcc[ii][jj] - dfc[ii][jj];					
+						rs[ii][jj] = dcc[ii][jj] - dfc[ii][jj];	
 						RS2 = rs[ii][jj] * rs[ii][jj];
-						RS2_sum += RS2;
-						RS2_ave += (RS2 - RS2_ave) / tmp_count;
+						tmp_sum += RS2;
 						tmp_count++;
 					}
 				}
 			}
-			
-			Sigma = sqrt(RS2_sum / tmp_count);
-			sum_Sigma += Sigma;
+			// accuracy from residuals
+			RR = sqrt(tmp_sum / tmp_count);
+			sum_RR += RR;
 
 			for (int i = 0; i < ctrl->NUM_ROWS; i++) {
 				for (int j = 0; j < ctrl->NUM_COLS; j++) {
@@ -1400,14 +1692,6 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 			CF = abs(correlation(dff, dcf, ctrl->NUM_ROWS, ctrl->NUM_COLS, ctrl->INVALID));
 			sum_CF += CF;
 
-			// residues
-			RR = sqrt( RS2_ave );
-			RR = sqrt(RS2_sum /tmp_count);
-			sum_RR += RR;
-
-			cout << "B = " << b << endl;
-			log_file << "B = " << b << endl;
-
 			// residual adjustments
 			if (!ctrl->RC_METHOD.compare("biliear")) {
 				
@@ -1427,9 +1711,9 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 				// re-evaluate
 				block_mean(sensor_p[im]->fimage.data[b], fc_idata, rsc_blend, fc_pdata, ctrl->NUM_ROWS, ctrl->NUM_COLS, BLOCK_ROWS, BLOCK_COLS, ctrl->INVALID);
 
-				tmp_count = 1;
-				RS2_ave = 0.0;
-				RS2_sum = 0.0;
+				
+				tmp_sum = 0.0;
+				tmp_count = 0;
 				for (int ii = 0; ii < ORG_C_ROWS; ii++) {
 					for (int jj = 0; jj < ORG_C_COLS; jj++) {
 						// the following code is not necessary because dcc was calculated already.
@@ -1454,14 +1738,14 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 						else {
 							rs[ii][jj] = dcc[ii][jj] - dfc[ii][jj];
 							RS2 = rs[ii][jj] * rs[ii][jj];
-							RS2_sum += RS2;
-							RS2_ave += (RS2 - RS2_ave) / tmp_count;
+							tmp_sum += RS2;
 							tmp_count++;
 						}
 					}
 				}
-				Sigma2 = sqrt(RS2_sum / tmp_count);
-				sum_Sigma2 += Sigma2;
+				// accuracy from the adjusted residuals
+				RR2 = sqrt(tmp_sum / tmp_count);
+				sum_RR2 += RR2;
 
 				for (int i = 0; i < ctrl->NUM_ROWS; i++) {
 					for (int j = 0; j < ctrl->NUM_COLS; j++) {
@@ -1490,15 +1774,12 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 				CF2 = abs(correlation(dff, dcf, ctrl->NUM_ROWS, ctrl->NUM_COLS, ctrl->INVALID));
 				sum_CF2 += CF2;
 
-				// residues
-				RR2 = sqrt(RS2_ave);
-				RR2 = sqrt(RS2_sum / tmp_count);
-				sum_RR2 += RR2;
 
-				cout << "S1 = " << Sigma << "; CC1 = " << CC << "; CF1 = " << CF << ", RR1 = " << RR << endl;
-				log_file << "S1 = " << Sigma << "; CC1 = " << CC << "; CF1 = " << CF << ", RR1 = " << RR << endl;
-				cout << "S2 = " << Sigma << "; CC2 = " << CC2 << "; CF2 = " << CF2 << ", RR2 = " << RR2 << endl;
-				log_file << "S2 = " << Sigma << "; CC2 = " << CC2 << "; CF2 = " << CF2 << ", RR2 = " << RR2 << endl;
+				// output the optimization indicators before and after the residual corrections
+				cout << "B = " << b << ": S1 = " << Sigma << "; CC1 = " << CC << "; CF1 = " << CF << ", RR1 = " << RR << endl;
+				log_file << "B = " << b << ": S1 = " << Sigma << "; CC1 = " << CC << "; CF1 = " << CF << ", RR1 = " << RR << endl;
+				cout << "B = " << b << ": S2 = " << Sigma << "; CC2 = " << CC2 << "; CF2 = " << CF2 << ", RR2 = " << RR2 << endl;
+				log_file << "B = " << b << ": S2 = " << Sigma << "; CC2 = " << CC2 << "; CF2 = " << CF2 << ", RR2 = " << RR2 << endl;
 
 				// compare the sum of the residual squares before and after the residual corrections
 				if (CF2 > CF && CC2 > CC && RR2 < RR) {
@@ -1513,10 +1794,14 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 				}
 			}
 
-			cout << "S = " << Sigma << "; CC = " << CC << "; CF = " << CF << ", RR = " << RR << endl;
-			log_file << "S = " << Sigma << "; CC = " << CC << "; CF = " << CF << ", RR = " << RR << endl;
+			cout << "B = " << b << ": S = " << Sigma << "; CC = " << CC << "; CF = " << CF << ", RR = " << RR << ", MV = " << MV << endl;
+			log_file << "B = " << b << ": S = " << Sigma << "; CC = " << CC << "; CF = " << CF << ", RR = " << RR << ", MV = " << MV << endl;
 
 		}  // end of band loop
+		
+		// log the mean quality indicators
+		cout << "B = M: S = " << Sigma << "; CC = " << sum_CC / ctrl->NUM_BANDS << "; CF = " << sum_CF / ctrl->NUM_BANDS << ", RR = " << sum_RR / ctrl->NUM_BANDS << ", MV = " << sum_MV / ctrl->NUM_BANDS << endl;
+		log_file << "B = M: S = " << Sigma << "; CC = " << sum_CC / ctrl->NUM_BANDS << "; CF = " << sum_CF / ctrl->NUM_BANDS << ", RR = " << sum_RR / ctrl->NUM_BANDS << ", MV = " << sum_MV / ctrl->NUM_BANDS << endl;
 
 		if (!ctrl->CLUSTER_OPTIMAL.compare("CC")) {
 			cluster_optimal_value = 1.0 - sum_CC / ctrl->NUM_BANDS;
@@ -1528,7 +1813,7 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 			cluster_optimal_value = sum_RR;
 		}
 
-		if (cluster_optimal_value < cluster_optimal_value_old) {
+		if ((cluster_optimal_value < cluster_optimal_value_old) || !ctrl->CLUSTER_METHOD.compare("DONE")) {
 			cluster_optimal_value_old = cluster_optimal_value;
 
 			max_k = k;				// max value with k cluster
@@ -1557,19 +1842,17 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 	} // end of k (clustering) loop
 
 	if (!ctrl->CLUSTER_OPTIMAL.compare("CC")) {
-		cout << endl << "Cluster number: " << max_k << " has the maximun average value: CC = " << sum_CC / ctrl->NUM_BANDS << endl;
-		log_file << endl << "Cluster number: " << max_k << " has the maximun average value: CC = " << sum_CC / ctrl->NUM_BANDS << endl;
+		cout << endl << "Applied cluster number " << max_k << " has the optimized value: CC = " << (1 - cluster_optimal_value) << endl;
+		log_file << endl << "Applied cluster number " << max_k << " has the optimized value: CC = " << (1 - cluster_optimal_value) << endl;
 	}
 	else if (!ctrl->CLUSTER_OPTIMAL.compare("CF")) {
-		cout << endl << "Cluster number: " << max_k << " has the maximun average value: CF = " << sum_CF / ctrl->NUM_BANDS << endl;
-		log_file << endl << "Cluster number: " << max_k << " has the maximun average value: CF = " << sum_CF / ctrl->NUM_BANDS << endl;
+		cout << endl << "Applied cluster number " << max_k << " has the optimized value: CF = " << (1 - cluster_optimal_value) << endl;
+		log_file << endl << "Applied cluster number " << max_k << " has the optimized value: CF = " << (1 - cluster_optimal_value) << endl;
 	}
 	else if (!ctrl->CLUSTER_OPTIMAL.compare("RR")) {
-		cout << endl << "Cluster number: " << max_k << " has the smallest average value: RR = " << sum_RR / ctrl->NUM_BANDS << endl;
-		log_file << endl << "Cluster number: " << max_k << " has the smallest average value: RR = " << sum_RR / ctrl->NUM_BANDS << endl;
+		cout << endl << "Applied cluster number " << max_k << " has the optimized value: RR = " << cluster_optimal_value << endl;
+		log_file << endl << "Applied cluster number " << max_k << " has the optimized value: RR = " << cluster_optimal_value << endl;
 	}
-	
-	
 
 	// output the optimized blended image
 	for (int b = 0; b < ctrl->NUM_BANDS; b++) {
@@ -1581,7 +1864,7 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 	prd_output.close();
 	unctn_output.close();
 
-	cluster_output_fname = ctrl->TEMP_DIR; //    "D:\\cluster_";	// cluster output file name
+	cluster_output_fname = ctrl->TEMP_DIR;	// cluster output file name
 	cluster_output_fname.append("\\");
 	cluster_output_fname.append(fine_sensor_name);
 	cluster_output_fname.append("_cluster_");
@@ -1589,9 +1872,11 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 	if (blend_dir == FORWARD) {
 		prd_output_fname.append(image_date_info->pdt_date[pidx]);
 		cluster_output_fname.append("_FWD_");
+		ctrl->CLUSTER_FWD = max_k;
 	}
 	else {
 		cluster_output_fname.append("_BWD_");
+		ctrl->CLUSTER_BWD = max_k;
 	}
 
 	cluster_output_fname.append(to_string(max_k));
@@ -1614,6 +1899,7 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 			}
 		}
 	}
+	
 
 	// free memory
 	if (!ctrl->CLUSTER_DATA.compare("fine+coarse")) {
@@ -1647,14 +1933,14 @@ int PSRFM::psrfm_blending(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[], shor
 
 
 	for (int i = 0; i < ctrl->NUM_ROWS; i++) {
-		delete[] iClusters[i];
+		//delete[] iClusters[i];
 		delete[] dff[i];
 		delete[] dcf[i];
 		delete[] rsc[i];
 		delete[] rsc_blend[i];
 	}
 
-	delete[] iClusters;
+	//delete[] iClusters;
 	delete[] dff;
 	delete[] dcf;
 	delete[] rsc;
@@ -1823,7 +2109,7 @@ int PSRFM::psrfm_blending_block(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[]
 
 	// for OpenMP
 	// get number of cores and use all but minus 1
-	int numCores = omp_get_num_procs();
+	int numCores = omp_get_num_procs(); //ctrl->NUM_CORES
 	numCores--;
 
 	Eigen::initParallel();
@@ -1919,7 +2205,7 @@ int PSRFM::psrfm_blending_block(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[]
 		}
 
 		// clustering - use all the bands for clustering
-		KMeans(sensor_p[im]->fimage.data, iClusters, k+1, ctrl->NUM_BANDS, ctrl->NUM_ROWS, ctrl->NUM_COLS, ctrl->ITERATIONS, ctrl->MAX_DIFF_THRESHOLD, ctrl->INVALID);
+		KMeans(sensor_p[im]->fimage.data, iClusters, ctrl, k+1, ctrl->NUM_BANDS);
 
 		// get the cluster percetage within a coarse resolution pixel -- A is the output 
 		mk = area_fraction(iClusters, k, ctrl->NUM_ROWS, ctrl->NUM_COLS, ctrl->BLOCK_SIZE, A);
@@ -1995,6 +2281,7 @@ int PSRFM::psrfm_blending_block(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[]
 
 			// get the predicted image and its uncertainty
 			for (int i = 0; i < ctrl->NUM_ROWS; i++) {
+#pragma omp parallel for shared(blend_output,blend_uncertainty,sensor_p,Eigenfv,EigenQvv,iClusters) num_threads(numCores)
 				for (int j = 0; j < ctrl->NUM_COLS; j++) {
 					blend_output[b][i][j] = short(sensor_p[im]->fimage.data[b][i][j] + dt * Eigenfv(iClusters[i][j]));
 					blend_uncertainty[b][i][j] = short(ctrl->f_error*ctrl->f_error + dt * dt * EigenQvv(iClusters[i][j], iClusters[i][j]));
@@ -2019,6 +2306,7 @@ int PSRFM::psrfm_blending_block(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[]
 			}
 
 			for (int i = 0; i < ctrl->NUM_ROWS; i++) {
+#pragma omp parallel for shared(blend_output,sensor_p,dff,dcf,pimage) num_threads(numCores)
 				for (int j = 0; j < ctrl->NUM_COLS; j++) {
 					dff[i][j] = float(blend_output[b][i][j] - sensor_p[im]->fimage.data[b][i][j]);
 					dcf[i][j] = float(pimage[b][i][j] - sensor_p[im]->cimage.data[b][i][j]);
@@ -2060,6 +2348,7 @@ int PSRFM::psrfm_blending_block(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[]
 
 			for (int b = 0; b < ctrl->NUM_BANDS; b++) {
 				for (int i = 0; i < ctrl->NUM_ROWS; i++) {
+#pragma omp parallel for shared(blend_output,blend_uncertainty,saved_blend_image,saved_blend_image_uncertainty) num_threads(numCores)
 					for (int j = 0; j < ctrl->NUM_COLS; j++) {
 						saved_blend_image[b][i][j] = blend_output[b][i][j];
 						saved_blend_image_uncertainty[b][i][j] = (unsigned short)sqrt(blend_uncertainty[b][i][j]);
@@ -2082,13 +2371,13 @@ int PSRFM::psrfm_blending_block(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[]
 	} // end of k (clustering) loop
 
 	if (!ctrl->CLUSTER_OPTIMAL.compare("CC")) {
-		log_file << "Cluster number: " << max_k << " has the maximun average value: CC = " << sum_CC / ctrl->NUM_BANDS << endl;
+		log_file << "Applied cluster number " << max_k << " has the optimized value: CC = " << sum_CC / ctrl->NUM_BANDS << endl;
 	}
 	else if (!ctrl->CLUSTER_OPTIMAL.compare("CF")) {
-		log_file << "Cluster number: " << max_k << " has the maximun average value: CF = " << sum_CF / ctrl->NUM_BANDS << endl;
+		log_file << "Applied cluster number " << max_k << " has the optimized value: CF = " << sum_CF / ctrl->NUM_BANDS << endl;
 	}
 	else if (!ctrl->CLUSTER_OPTIMAL.compare("RR")) {
-		log_file << "Cluster number: " << max_k << " has the smallest average value: RR = " << sum_RR / ctrl->NUM_BANDS << endl;
+		log_file << "Applied cluster number " << max_k << " has the optimized value: RR = " << sum_RR / ctrl->NUM_BANDS << endl;
 	}
 
 
@@ -2131,6 +2420,7 @@ int PSRFM::psrfm_blending_block(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[]
 	// return the optimized blended images
 	for (int b = 0; b < ctrl->NUM_BANDS; b++) {
 		for (int i = 0; i < ctrl->NUM_ROWS; i++) {
+#pragma omp parallel for shared(blend_output,blend_uncertainty,saved_blend_image,saved_blend_image_uncertainty) num_threads(numCores)
 			for (int j = 0; j < ctrl->NUM_COLS; j++) {
 				blend_output[b][i][j] = saved_blend_image[b][i][j];
 				blend_uncertainty[b][i][j] = saved_blend_image_uncertainty[b][i][j] * saved_blend_image_uncertainty[b][i][j];
@@ -2186,7 +2476,7 @@ int PSRFM::psrfm_blending_block(int blend_dir, int pidx, SENSOR_PAIR *sensor_p[]
 
 // pidx: prediction index 
 // fine_sensor_name: for output file name prefix
-int PSRFM::psrfm_merge_output(int pidx, string fine_sensor_name, short ***forward_output, short ***forward_uncertainty, short ***backward_output, short ***backward_uncertainty, CONTROL_PARAMETER *ctrl, IMGAG_DATE_INFO *image_date_info) {
+string PSRFM::psrfm_merge_output(int pidx, SENSOR_PAIR *sensor_p[], SENSOR_PAIR *observ_p[], string fine_sensor_name, short ***forward_output, short ***forward_uncertainty, short ***backward_output, short ***backward_uncertainty, CONTROL_PARAMETER *ctrl, IMGAG_DATE_INFO *image_date_info, ofstream& log_file) {
 
 	ofstream blend_output_file;			// blended prediction output stream
 	string blend_output_fname;
@@ -2195,24 +2485,70 @@ int PSRFM::psrfm_merge_output(int pidx, string fine_sensor_name, short ***forwar
 	ofstream blend_unctn_file;			// blended uncertainty 
 	string blend_unctn_fname;
 
+	ofstream blend_mask_file;			// mask of blended image
+	string blend_mask_fname;
+
+	ofstream blend_output_file_m;		// merged blended prediction output stream
+	string blend_output_fname_m;
+	string blend_envi_hdr_fname_m;
+
+	ofstream blend_unctn_file_m;		// merged blended uncertainty 
+	string blend_unctn_fname_m;
+
+	ofstream blend_mask_file_m;			// mask of merged blended image
+	string blend_mask_fname_m;
+
+	ofstream cloud_mask_file_m;			// cloud and shadow mask for merging
+	string cloud_mask_fname_m;
+
+	string return_str;
+
 	int i;
 	int j;
 	int b;
+	int max_k;
+	long mfp = 0;						// merged fine image pixels
+	long totalp = 0;
+	long tpb = 0;
+	long tpf = 0;
+	long dfb = 0;
 
-	short **blend_output;
-	unsigned short **blend_uncertainty;
+	short ***fdata;						// fine image data on prediction date
+	unsigned char **fmask;				// fine image mask data on prediction date
+	unsigned char **fmask_ext;			// extended fine image mask data on prediction date
+
+	short ***blend_output;
+	unsigned short ***blend_uncertainty;
+	unsigned char **blend_mask;
 
 	float dt01;
 	float dt21;
 	float w01;
 	float w21;
 	float wsum;
+	float perc;
 	
-	blend_output = new short *[ctrl->NUM_ROWS];
-	blend_uncertainty = new unsigned short *[ctrl->NUM_ROWS];
+	fdata = new short **[ctrl->NUM_BANDS];
+	blend_output = new short **[ctrl->NUM_ROWS];
+	blend_uncertainty = new unsigned short **[ctrl->NUM_ROWS];
+	for (int b = 0; b < ctrl->NUM_BANDS; b++) {
+		fdata[b] = new short *[ctrl->NUM_ROWS];
+		blend_output[b] = new short *[ctrl->NUM_ROWS];
+		blend_uncertainty[b] = new unsigned short *[ctrl->NUM_ROWS];
+		for (i = 0; i < ctrl->NUM_ROWS; i++) {
+			fdata[b][i] = new short[ctrl->NUM_COLS];
+			blend_output[b][i] = new short[ctrl->NUM_COLS];
+			blend_uncertainty[b][i] = new unsigned short[ctrl->NUM_COLS];
+		}
+	}
+
+	blend_mask = new unsigned char *[ctrl->NUM_ROWS];
+	fmask = new unsigned char *[ctrl->NUM_ROWS];
+	fmask_ext = new unsigned char *[ctrl->NUM_ROWS];
 	for (i = 0; i < ctrl->NUM_ROWS; i++) {
-		blend_output[i] = new short[ctrl->NUM_COLS];
-		blend_uncertainty[i] = new unsigned short[ctrl->NUM_COLS];
+		fmask[i] = new unsigned char[ctrl->NUM_COLS];
+		fmask_ext[i] = new unsigned char[ctrl->NUM_COLS];
+		blend_mask[i] = new unsigned char[ctrl->NUM_COLS];
 	}
 	
 	blend_output_fname = ctrl->OUTPUT_DIR;
@@ -2223,15 +2559,100 @@ int PSRFM::psrfm_merge_output(int pidx, string fine_sensor_name, short ***forwar
 
 	blend_envi_hdr_fname = blend_output_fname;
 	blend_unctn_fname = blend_output_fname;
-	blend_unctn_fname.append("_Q.dat");
+	blend_mask_fname = blend_output_fname;
 
-	blend_output_fname.append("_PSRFM.dat");
-	blend_envi_hdr_fname.append("_PSRFM.hdr");
+	blend_output_fname_m = blend_output_fname;
+	blend_envi_hdr_fname_m = blend_output_fname;
+	blend_unctn_fname_m = blend_output_fname;
+	blend_mask_fname_m = blend_output_fname;
+	cloud_mask_fname_m = blend_output_fname;
 
-	blend_output_file.open(blend_output_fname.c_str(), ios::out | ios::binary);
-	blend_unctn_file.open(blend_unctn_fname.c_str(), ios::out | ios::binary);
+	if (!ctrl->PREDICT_MODEL.compare("KFRFM")) {
+		blend_output_fname.append("_KFRFM.dat");
+		blend_envi_hdr_fname.append("_KFRFM.hdr");
+		blend_unctn_fname.append("_KFRFM_Q.dat");
+		blend_mask_fname.append("_KFRFM_mask.dat");
+
+		blend_output_fname_m.append("_KFRFM_m.dat");
+		blend_envi_hdr_fname_m.append("_KFRFM_m.hdr");
+		blend_unctn_fname_m.append("_KFRFM_Q_m.dat");
+		blend_mask_fname_m.append("_KFRFM_mask_m.dat");
+		cloud_mask_fname_m.append("_KFRFM_cloud_mask_m.dat");
+	} 
+	else {
+		blend_output_fname.append("_PSRFM.dat");
+		blend_envi_hdr_fname.append("_PSRFM.hdr");
+		blend_unctn_fname.append("_PSRFM_Q.dat");
+		blend_mask_fname.append("_PSRFM_mask.dat");
+
+		blend_output_fname_m.append("_PSRFM_m.dat");
+		blend_envi_hdr_fname_m.append("_PSRFM_m.hdr");
+		blend_unctn_fname_m.append("_PSRFM_Q_m.dat");
+		blend_mask_fname_m.append("_PSRFM_mask_m.dat");
+		cloud_mask_fname_m.append("_PSRFM_cloud_mask_m.dat");
+	}
+
+	// initialize mask values to all zeros
+	for (i = 0; i < ctrl->NUM_ROWS; i++) {
+		for (j = 0; j < ctrl->NUM_COLS; j++) {
+			blend_mask[i][j] = 0;
+			fmask[i][j] = 0;
+			fmask_ext[i][j] = 0;
+		}
+	}
+
+	// initialize blended image values to all zeros
+	for (b = 0; b < ctrl->NUM_BANDS; b++) {
+		for (i = 0; i < ctrl->NUM_ROWS; i++) {
+			for (j = 0; j < ctrl->NUM_COLS; j++) {
+				fdata[b][i][j] = 0;
+				blend_output[b][i][j] = 0;
+				blend_uncertainty[b][i][j] = 0;
+			}
+		}
+	}
+
+	cout << endl << "Merging forward and backward predictions ..." << endl;
+	log_file << endl << "Merging forward and backward predictions ..." << endl;
+
+	int numCores = omp_get_num_procs(); //ctrl->NUM_CORES
+	numCores--;
 	
-	if (!ctrl->MERGE_METHOD.compare("temporal")) {   // merge based on time interval
+	if (!ctrl->MERGE_METHOD.compare("uncertainty") || !ctrl->PREDICT_MODEL.compare("KFRFM")) {		// merge based on uncertainty
+		for (b = 0; b < ctrl->NUM_BANDS; b++) {
+			for (i = 0; i < ctrl->NUM_ROWS; i++) {
+//#pragma omp parallel for shared(forward_output, forward_uncertainty, backward_output,backward_uncertainty,blend_output,blend_uncertainty) num_threads(numCores)
+				for (j = 0; j < ctrl->NUM_COLS; j++) {
+
+					w01 = float(1.0 / forward_uncertainty[b][i][j]);
+					w21 = float(1.0 / backward_uncertainty[b][i][j]);
+
+					wsum = w01 + w21;
+					w01 = w01 / wsum;
+					w21 = w21 / wsum;
+
+					if (forward_output[b][i][j] != ctrl->INVALID && backward_output[b][i][j] != ctrl->INVALID) {
+						blend_output[b][i][j] = short(forward_output[b][i][j] * w01 + backward_output[b][i][j] * w21);
+						blend_uncertainty[b][i][j] = (unsigned short)sqrt(forward_uncertainty[b][i][j] * w01 * w01 + backward_uncertainty[b][i][j] * w21 * w21);
+					}
+					else if (forward_output[b][i][j] != ctrl->INVALID && backward_output[b][i][j] == ctrl->INVALID) {
+						blend_output[b][i][j] = short(forward_output[b][i][j]);
+						blend_uncertainty[b][i][j] = (unsigned short)sqrt(forward_uncertainty[b][i][j]);
+					}
+					else if (forward_output[b][i][j] == ctrl->INVALID && backward_output[b][i][j] != ctrl->INVALID) {
+						blend_output[b][i][j] = short(backward_output[b][i][j]);
+						blend_uncertainty[b][i][j] = (unsigned short)sqrt(backward_uncertainty[b][i][j]);
+					}
+					else {
+						blend_output[b][i][j] = short(ctrl->INVALID);
+						blend_uncertainty[b][i][j] = (unsigned short)(ctrl->INVALID);
+						blend_mask[i][j] += 1;    // note: 0: normal value, >=1 invalid
+					}
+				}
+			}
+		}
+	}
+	else if (!ctrl->MERGE_METHOD.compare("temporal")) {   // merge based on time interval
 		
 		dt01 = float(abs(image_date_info->date_num[0] - image_date_info->pdt_date_num[pidx]));
 		dt21 = float(abs(image_date_info->date_num[1] - image_date_info->pdt_date_num[pidx]));
@@ -2245,92 +2666,290 @@ int PSRFM::psrfm_merge_output(int pidx, string fine_sensor_name, short ***forwar
 
 		for (b = 0; b < ctrl->NUM_BANDS; b++) {
 			for (i = 0; i < ctrl->NUM_ROWS; i++) {
+//#pragma omp parallel for shared(forward_output, forward_uncertainty, backward_output,backward_uncertainty,blend_output,blend_uncertainty) num_threads(numCores)
 				for (j = 0; j < ctrl->NUM_COLS; j++) {
 					if (forward_output[b][i][j] != ctrl->INVALID && backward_output[b][i][j] != ctrl->INVALID) {
-						blend_output[i][j] = short(forward_output[b][i][j] * w01 + backward_output[b][i][j] * w21);
-						blend_uncertainty[i][j] = (unsigned short)(forward_uncertainty[b][i][j] * w01 * w01 + backward_uncertainty[b][i][j] * w21 * w21);
-						blend_uncertainty[i][j] = (unsigned short)sqrt(blend_uncertainty[i][j]);
+						blend_output[b][i][j] = short(forward_output[b][i][j] * w01 + backward_output[b][i][j] * w21);
+						blend_uncertainty[b][i][j] = (unsigned short)sqrt(forward_uncertainty[b][i][j] * w01 * w01 + backward_uncertainty[b][i][j] * w21 * w21);
 					}
 					else if (forward_output[b][i][j] != ctrl->INVALID && backward_output[b][i][j] == ctrl->INVALID) {
-						blend_output[i][j] = short(forward_output[b][i][j]);
-						blend_uncertainty[i][j] = (unsigned short)(forward_uncertainty[b][i][j]);
-						blend_uncertainty[i][j] = (unsigned short)sqrt(blend_uncertainty[i][j]);
+						blend_output[b][i][j] = short(forward_output[b][i][j]);
+						blend_uncertainty[b][i][j] = (unsigned short)sqrt(forward_uncertainty[b][i][j]);
 					}
 					else if (forward_output[b][i][j] == ctrl->INVALID && backward_output[b][i][j] != ctrl->INVALID) {
-						blend_output[i][j] = short(backward_output[b][i][j]);
-						blend_uncertainty[i][j] = (unsigned short)(backward_uncertainty[b][i][j]);
-						blend_uncertainty[i][j] = (unsigned short)sqrt(blend_uncertainty[i][j]);
+						blend_output[b][i][j] = short(backward_output[b][i][j]);
+						blend_uncertainty[b][i][j] = (unsigned short)sqrt(backward_uncertainty[b][i][j]);
 					}
 					else {
-						blend_output[i][j] = short(ctrl->INVALID);
-						blend_uncertainty[i][j] = (unsigned short)(ctrl->INVALID);
+						blend_output[b][i][j] = short(ctrl->INVALID);
+						blend_uncertainty[b][i][j] = (unsigned short)(ctrl->INVALID);
+						blend_mask[i][j] += 1;		// note: 0: normal value, >=1 invalid
 					}
 				}
-				blend_output_file.write(reinterpret_cast<char *>(blend_output[i]), sizeof(short)*ctrl->NUM_COLS);
-				blend_unctn_file.write(reinterpret_cast<char *>(blend_uncertainty[i]), sizeof(unsigned short)*ctrl->NUM_COLS);
 			}
 		}
 	}
-	else if (!ctrl->MERGE_METHOD.compare("uncertainty")) {		// merge based on uncertainty
 
-		for (b = 0; b < ctrl->NUM_BANDS; b++) {
-			for (i = 0; i < ctrl->NUM_ROWS; i++) {
-				for (j = 0; j < ctrl->NUM_COLS; j++) {
+	// save the blended results into files
+	blend_output_file.open(blend_output_fname.c_str(), ios::out | ios::binary);
+	blend_unctn_file.open(blend_unctn_fname.c_str(), ios::out | ios::binary);
+	blend_mask_file.open(blend_mask_fname.c_str(), ios::out | ios::binary);
 
-					w01 = float(1.0 / forward_uncertainty[b][i][j]);
-					w21 = float(1.0 / backward_uncertainty[b][i][j]);
-
-					wsum = w01 + w21;
-					w01 = w01 / wsum;
-					w21 = w21 / wsum;
-
-					if (forward_output[b][i][j] != ctrl->INVALID && backward_output[b][i][j] != ctrl->INVALID) {
-						blend_output[i][j] = short(forward_output[b][i][j] * w01 + backward_output[b][i][j] * w21);
-						blend_uncertainty[i][j] = (unsigned short)(forward_uncertainty[b][i][j] * w01 * w01 + backward_uncertainty[b][i][j] * w21 * w21);
-						blend_uncertainty[i][j] = (unsigned short)sqrt(blend_uncertainty[i][j]);
-					}
-					else if (forward_output[b][i][j] != ctrl->INVALID && backward_output[b][i][j] == ctrl->INVALID) {
-						blend_output[i][j] = short(forward_output[b][i][j]);
-						blend_uncertainty[i][j] = (unsigned short)(forward_uncertainty[b][i][j]);
-						blend_uncertainty[i][j] = (unsigned short)sqrt(blend_uncertainty[i][j]);
-					}
-					else if (forward_output[b][i][j] == ctrl->INVALID && backward_output[b][i][j] != ctrl->INVALID) {
-						blend_output[i][j] = short(backward_output[b][i][j]);
-						blend_uncertainty[i][j] = (unsigned short)(backward_uncertainty[b][i][j]);
-						blend_uncertainty[i][j] = (unsigned short)sqrt(blend_uncertainty[i][j]);
-					}
-					else {
-						blend_output[i][j] = short(ctrl->INVALID);
-						blend_uncertainty[i][j] = (unsigned short)(ctrl->INVALID);
-					}
-				}
-				blend_output_file.write(reinterpret_cast<char *>(blend_output[i]), sizeof(short)*ctrl->NUM_COLS);
-				blend_unctn_file.write(reinterpret_cast<char *>(blend_uncertainty[i]), sizeof(unsigned short)*ctrl->NUM_COLS);
-			}
+	for (b = 0; b < ctrl->NUM_BANDS; b++) {
+		for (i = 0; i < ctrl->NUM_ROWS; i++) {
+			blend_output_file.write(reinterpret_cast<char *>(blend_output[b][i]), sizeof(short)*ctrl->NUM_COLS);
+			blend_unctn_file.write(reinterpret_cast<char *>(blend_uncertainty[b][i]), sizeof(unsigned short)*ctrl->NUM_COLS);
 		}
+	}
+
+	// save mask values 
+	for (i = 0; i < ctrl->NUM_ROWS; i++) {
+		blend_mask_file.write(reinterpret_cast<char *>(blend_mask[i]), sizeof(unsigned char)*ctrl->NUM_COLS);
 	}
 
 	blend_output_file.close();
 	blend_unctn_file.close();
+	blend_mask_file.close();
 
 	// copy a ENVI header file for geospatial information
 	ifstream source(ctrl->ENVI_HDR, ios::binary);
 	ofstream dest(blend_envi_hdr_fname, ios::binary);
-
 	dest << source.rdbuf();
-
 	source.close();
 	dest.close();
 
-	for (i = 0; i < ctrl->NUM_ROWS; i++) {
-		delete[] blend_output[i];
-		delete[] blend_uncertainty[i];
+	// apply fine pixels on prediction date to replace the blended pixel if it is selected
+	if (observ_p[pidx]->fimage.fname.compare("") && !ctrl->MERGE_FINE.compare("YES")) {
+
+		// read in fine image on the prediction date
+		read_fimage_data(fdata, observ_p[pidx]->fimage.fname, fmask, observ_p[pidx]->fimage.mfname, ctrl);
+		cout << endl << "Read in fine image on prediction date." << endl;
+		log_file << endl << "Read in fine image on prediction date." << endl;
+
+		// compare blended image against the original fine image to determine the cloud mask first
+		for (i = 0; i < ctrl->NUM_ROWS; i++) {
+			for (j = 0; j < ctrl->NUM_COLS; j++) {
+				tpb = 0;  tpf = 0;  fmask[i][j] = 0;
+				for (int bb = 0; bb < ctrl->NUM_BANDS; bb++) {
+					tpb += blend_output[bb][i][j];
+					tpf += fdata[bb][i][j];
+				}
+				dfb = (tpf - tpb) / ctrl->NUM_BANDS;
+				if (abs(dfb) < ctrl->MERGE_FINE_THRESHOLD) {
+					fmask[i][j] = 0;
+				}
+				else if (dfb > ctrl->MERGE_FINE_THRESHOLD) {
+					fmask[i][j] = 1;
+				}
+				else
+				{
+					fmask[i][j] = 2;
+				}
+			}
+		}
+
+		// save the cloud and shadow mask into
+		cloud_mask_file_m.open(cloud_mask_fname_m.c_str(), ios::out | ios::binary);
+		for (i = 0; i < ctrl->NUM_ROWS; i++) {
+			cloud_mask_file_m.write(reinterpret_cast<char *>(fmask[i]), sizeof(unsigned char)*ctrl->NUM_COLS);
+		}
+		cloud_mask_file_m.close();
+
+		// extend mask area according to ctrl->MERGE_EXTENTION
+		// copy the original mask to extended mask
+		for (i = 0; i < ctrl->NUM_ROWS; i++) {
+			for (j = 0; j < ctrl->NUM_COLS; j++) {
+				fmask_ext[i][j] = fmask[i][j];
+			}
+		}
+		// extend the mask
+		for (i = 0; i < ctrl->NUM_ROWS; i++) {
+			for (j = 0; j < ctrl->NUM_COLS; j++) {
+				int r1 = i - ctrl->MERGE_MASK_EXTEND;
+				int r2 = i + ctrl->MERGE_MASK_EXTEND;
+				int c1 = j - ctrl->MERGE_MASK_EXTEND;
+				int c2 = j + ctrl->MERGE_MASK_EXTEND;
+				if (r1 < 0) r1 = 0;
+				if (r2 > ctrl->NUM_ROWS) r2 = ctrl->NUM_ROWS;
+				if (c1 < 0) c1 = 0;
+				if (c2 > ctrl->NUM_COLS) c2 = ctrl->NUM_COLS;
+				if (fmask[i][j] > 0)
+				{
+					for (int ii = r1; ii < r2; ii++) {
+						for (int jj = c1; jj < c2; jj++) {
+							fmask_ext[ii][jj] = 1;
+						}
+					}
+				}
+			}
+		}
+
+		// use cloud - free fine pixels to replace the blended pixels
+		// determine the cluster number
+		if (ctrl->CLUSTER_FWD > ctrl->CLUSTER_BWD)
+		{
+			max_k = ctrl->CLUSTER_FWD;
+		}
+		else {
+			max_k = ctrl->CLUSTER_FWD;
+		}
+		
+		// reset mask values to all zeros for cluster numbers
+		for (i = 0; i < ctrl->NUM_ROWS; i++) {
+			for (j = 0; j < ctrl->NUM_COLS; j++) {
+				fmask[i][j] = 0;
+			}
+		}
+		// cluster the blended image for normalization
+		KMeans(blend_output, fmask, ctrl, max_k, ctrl->NUM_BANDS);
+
+		// performing normalization for each cluster and each band in a loop
+		for (b = 0; b < ctrl->NUM_BANDS; b++) {
+			for (int k = 0; k < max_k-1; k++) {
+			
+				// retreive cloud-free pixels of cluster k
+				std::vector<double> xData;
+				std::vector<double> yData;
+				std::vector<double> x;
+				std::vector<double> y;
+				for (i = 0; i < ctrl->NUM_ROWS; i++) {
+					for (j = 0; j < ctrl->NUM_COLS; j++) {
+						if (fmask[i][j] == k && fmask_ext[i][j] == 0) {
+							xData.push_back(double(blend_output[b][i][j]));
+							yData.push_back(double(fdata[b][i][j]));
+						}
+					}
+				}
+				// estimate parameters for normalization
+				std::vector<double> linearReg = GetLinearFit(yData, xData);
+				// cout << " cluster = " << k << " band = " << b << " n = " << yData.size() << " a = " << linearReg[0] << " b = " << linearReg[1] << endl;
+
+				// remove possible outliers in the data
+				for (i = 0; i < yData.size(); i++) {
+					if ((xData[i] * linearReg[0] + linearReg[1] - yData[i]) < 2.5* linearReg[2]) {
+						x.push_back(xData[i]);
+						y.push_back(yData[i]);
+					}
+				}				
+				
+				// re-estimate the parameters for normalization after removing outliers
+				linearReg = std::vector<double>();
+				linearReg = GetLinearFit(y, x);
+				// cout << " cluster = " << k << " band = " << b << " n = " << y.size() << " a1 = " << linearReg[0] << " b1 = " << linearReg[1] << endl;
+				
+
+				// normalize the blended pixels
+				for (i = 0; i < ctrl->NUM_ROWS; i++) {
+//#pragma omp parallel for shared(blend_output,fmask,linearReg) num_threads(numCores)
+					for (j = 0; j < ctrl->NUM_COLS; j++) {
+						if (fmask[i][j] == k) {
+							blend_output[b][i][j] = short(linearReg[0] * double(blend_output[b][i][j]) + linearReg[1]);
+						}
+					}
+				}
+				// clear xData yData and linearReg
+				xData = std::vector<double>();
+				yData = std::vector<double>();
+				x = std::vector<double>();
+				y = std::vector<double>();
+				linearReg = std::vector<double>();
+			}
+		}
+
+		// replace the blended pixels with the cloud-free pixels
+		mfp = 0;
+		for (b = 0; b < ctrl->NUM_BANDS; b++) {
+			for (i = 0; i < ctrl->NUM_ROWS; i++) {
+//#pragma omp parallel for shared(blend_output,blend_uncertainty,fdata,blend_mask) num_threads(numCores)
+				for (j = 0; j < ctrl->NUM_COLS; j++) {
+					if (fmask_ext[i][j] == 0) {
+						blend_output[b][i][j] = fdata[b][i][j];
+						blend_uncertainty[b][i][j] = (unsigned short)(ctrl->f_error);
+						blend_mask[i][j] = 0;    // note: 0: normal value, >=1 invalid
+						mfp++;
+					}
+				}
+			}
+		}
+
+		// save the merged results into files
+		blend_output_file_m.open(blend_output_fname_m.c_str(), ios::out | ios::binary);
+		blend_unctn_file_m.open(blend_unctn_fname_m.c_str(), ios::out | ios::binary);
+		blend_mask_file_m.open(blend_mask_fname_m.c_str(), ios::out | ios::binary);
+
+		for (b = 0; b < ctrl->NUM_BANDS; b++) {
+			for (i = 0; i < ctrl->NUM_ROWS; i++) {
+				blend_output_file_m.write(reinterpret_cast<char *>(blend_output[b][i]), sizeof(short)*ctrl->NUM_COLS);
+				blend_unctn_file_m.write(reinterpret_cast<char *>(blend_uncertainty[b][i]), sizeof(unsigned short)*ctrl->NUM_COLS);
+			}
+		}
+
+		// save mask values 
+		for (i = 0; i < ctrl->NUM_ROWS; i++) {
+			blend_mask_file_m.write(reinterpret_cast<char *>(blend_mask[i]), sizeof(unsigned char)*ctrl->NUM_COLS);
+		}
+
+		blend_output_file_m.close();
+		blend_unctn_file_m.close();
+		blend_mask_file_m.close();
+
+		// copy a ENVI header file for geospatial information
+		ifstream source_m(ctrl->ENVI_HDR, ios::binary);
+		ofstream dest_m(blend_envi_hdr_fname_m, ios::binary);
+		dest_m << source_m.rdbuf();
+		source_m.close();
+		dest_m.close();
+
+		totalp = ctrl->NUM_BANDS*ctrl->NUM_ROWS*ctrl->NUM_COLS;
+		perc = float(mfp) / float(totalp) * 100;
+		cout << "Merged fine image pixels on prediction date: " << mfp << " of " << totalp << " or " << perc << "%" << endl;
+		log_file << "Merged fine image pixels on prediction date: " << mfp << " of " << totalp << " or " << perc << "%" << endl;
+
+		// reset the fine image data file names at start for KFRFM
+		if ((!ctrl->PREDICT_MODEL.compare("KFRFM")) && (pidx < ctrl->NUM_PREDICTIONS) - 1) {
+			sensor_p[0]->fimage.fname = blend_output_fname_m;
+			sensor_p[0]->fimage.vfname = blend_unctn_fname_m;
+			sensor_p[0]->fimage.mfname = blend_mask_fname_m;
+		}
+	}
+	else
+	{ 	// reset the fine image data file names at start for KFRFM
+		if ((!ctrl->PREDICT_MODEL.compare("KFRFM")) && (pidx < ctrl->NUM_PREDICTIONS) - 1) {
+			sensor_p[0]->fimage.fname = blend_output_fname;
+			sensor_p[0]->fimage.vfname = blend_unctn_fname;
+			sensor_p[0]->fimage.mfname = blend_mask_fname;
+		}
 	}
 
+	// free memory for the fine image and mask data
+	for (int b = 0; b < ctrl->NUM_BANDS; b++) {
+		for (i = 0; i < ctrl->NUM_ROWS; i++) {
+			delete[] fdata[b][i];
+			delete[] blend_output[b][i];
+			delete[] blend_uncertainty[b][i];
+		}
+	}
+	delete[] fdata;
 	delete[] blend_output;
 	delete[] blend_uncertainty;
 
-	return 0;
+	for (i = 0; i < ctrl->NUM_ROWS; i++) {
+		delete[] fmask[i];
+		delete[] fmask_ext[i];
+		delete[] blend_mask[i];
+	}	
+	delete[] fmask;
+	delete[] fmask_ext;
+	delete[] blend_mask;
+
+	// return the output file name and uncertainty file name etc. 
+	return_str = blend_output_fname;
+	return_str.append(" ");
+	return_str.append(blend_unctn_fname);
+	return_str.append(" ");
+	return_str.append(blend_mask_fname);
+
+	return return_str;
 }
 
 void PSRFM::doOnePixel(int i, int j, double **cluster_mean, short ***idata, unsigned char **idata_cluster, int K, int B, int inval) {
@@ -2389,7 +3008,7 @@ void PSRFM::doOnePixel(int i, int j, double **cluster_mean, short ***idata, unsi
 }
 
 
-void PSRFM::KMeans(short ***idata, unsigned char **idata_cluster, int K, int B, int rows, int cols, int iterations, float MAX_DIFF_THRESHOLD, int inval) {
+void PSRFM::KMeans(short ***idata, unsigned char **idata_cluster, CONTROL_PARAMETER *ctrl, int K, int B) {
 
 	//ofstream mean_out;
 	//mean_out.open("mean_out.txt", std::ofstream::out | std::ofstream::app);
@@ -2424,9 +3043,9 @@ void PSRFM::KMeans(short ***idata, unsigned char **idata_cluster, int K, int B, 
 
 	// count grid points with at least one invalid pixel in a band
 	inval_count = 0;
-	for (int i = 0; i < rows; i++) {
-		for (int j = 0; j < cols; j++) {
-			if (idata[0][i][j] == inval) {
+	for (int i = 0; i < ctrl->NUM_ROWS; i++) {
+		for (int j = 0; j < ctrl->NUM_COLS; j++) {
+			if (idata[0][i][j] == ctrl->INVALID) {
 				inval_count++;
 			}
 		}
@@ -2437,7 +3056,7 @@ void PSRFM::KMeans(short ***idata, unsigned char **idata_cluster, int K, int B, 
 	if (inval_count > 1) {
 		K1 = K - 1;
 		for (int b = 0; b < B; b++) {
-			cluster_mean[K - 1][b] = inval;
+			cluster_mean[K - 1][b] = ctrl->INVALID;
 		}
 	}
 	else {
@@ -2447,8 +3066,8 @@ void PSRFM::KMeans(short ***idata, unsigned char **idata_cluster, int K, int B, 
 	// initialize the clusters
 	for (int k = 0; k < K1; k++) {
 		find_cnt = 0;
-		cluster_row = rand() % rows;
-		cluster_col = rand() % cols;
+		cluster_row = rand() % ctrl->NUM_ROWS;
+		cluster_col = rand() % ctrl->NUM_COLS;
 
 		for (int n = 0; n < c_id; n++) {
 			if (cluster_row == cluster_rows[n] && cluster_col == cluster_cols[n]) {
@@ -2480,19 +3099,19 @@ void PSRFM::KMeans(short ***idata, unsigned char **idata_cluster, int K, int B, 
 	double center_diff;
 
 	// get number of cores and use all but minus 1
-	int numCores = omp_get_num_procs();
+	int numCores = ctrl->NUM_CORES;		// omp_get_num_procs();
 	numCores--;
 
 
 	// assign each pixel to one of the clusters
-	for (int i = 0; i < rows; i++) {
+	for (int i = 0; i < ctrl->NUM_ROWS; i++) {
 #pragma omp parallel for shared(cluster_mean, idata, idata_cluster) num_threads(numCores)
-		for (int j = 0; j < cols; j++) {
-			if (idata[0][i][j] == inval) {
+		for (int j = 0; j < ctrl->NUM_COLS; j++) {
+			if (idata[0][i][j] == ctrl->INVALID) {
 				idata_cluster[i][j] = K-1;				
 			}
 			else {
-				doOnePixel(i, j, cluster_mean, idata, idata_cluster, K, B, inval);
+				doOnePixel(i, j, cluster_mean, idata, idata_cluster, K, B, ctrl->INVALID);
 			}
 			// doOnePixel(i, j, cluster_mean, idata, idata_cluster, K, B, inval);
 		}
@@ -2500,7 +3119,7 @@ void PSRFM::KMeans(short ***idata, unsigned char **idata_cluster, int K, int B, 
 	
 
 	// iteration
-	for (int iter = 0; iter < iterations; iter++) {
+	for (int iter = 0; iter < ctrl->ITERATIONS; iter++) {
 
 		//cout << "Iteration = " << iter << endl;
 		max_diff = 0;
@@ -2513,8 +3132,8 @@ void PSRFM::KMeans(short ***idata, unsigned char **idata_cluster, int K, int B, 
 		}
 
 		// calculate new cluster mean for each cluster using the previous cluster information of every pixel
-		for (int i = 0; i < rows; i++) {
-			for (int j = 0; j < cols; j++) {
+		for (int i = 0; i < ctrl->NUM_ROWS; i++) {
+			for (int j = 0; j < ctrl->NUM_COLS; j++) {
 				c_id = idata_cluster[i][j];
 				cluster_count[c_id]++;
 				for (int b = 0; b < B; b++) {
@@ -2535,7 +3154,7 @@ void PSRFM::KMeans(short ***idata, unsigned char **idata_cluster, int K, int B, 
 			}
 		}
 
-		if (max_diff < MAX_DIFF_THRESHOLD) {
+		if (max_diff < ctrl->MAX_DIFF_THRESHOLD) {
 			break;
 		}
 
@@ -2547,14 +3166,14 @@ void PSRFM::KMeans(short ***idata, unsigned char **idata_cluster, int K, int B, 
 
 		// derive the new cluster id for every pixel using the new cluster mean if difference is big
 
-		for (int i = 0; i < rows; i++) {
+		for (int i = 0; i < ctrl->NUM_ROWS; i++) {
 #pragma omp parallel for shared(cluster_mean, idata, idata_cluster) num_threads(numCores)
-			for (int j = 0; j < cols; j++) {
-				if (idata[0][i][j] == inval) {
+			for (int j = 0; j < ctrl->NUM_COLS; j++) {
+				if (idata[0][i][j] == ctrl->INVALID) {
 					idata_cluster[i][j] = K - 1;
 				}
 				else {
-					doOnePixel(i, j, cluster_mean, idata, idata_cluster, K, B, inval);
+					doOnePixel(i, j, cluster_mean, idata, idata_cluster, K, B, ctrl->INVALID);
 				}
 				// doOnePixel(i, j, cluster_mean, idata, idata_cluster, K, B, inval);
 			}
@@ -2565,8 +3184,8 @@ void PSRFM::KMeans(short ***idata, unsigned char **idata_cluster, int K, int B, 
 	// check count of last cluster for invalid pixels
 	inval_count = 0;
 	if (K1 == K - 1) {
-		for (int i = 0; i < rows; i++) {
-			for (int j = 0; j < cols; j++) {
+		for (int i = 0; i < ctrl->NUM_ROWS; i++) {
+			for (int j = 0; j < ctrl->NUM_COLS; j++) {
 				if (idata_cluster[i][j] == K - 1) {
 					inval_count++;
 				}
@@ -2665,7 +3284,7 @@ void PSRFM::get_image_date_info(string fname, int *date_int, string *date_string
 
 }
 
-int PSRFM::check_input_parameters(CONTROL_PARAMETER *ctrl, IMGAG_DATE_INFO *image_date_info) {
+int PSRFM::check_input_parameters(CONTROL_PARAMETER *ctrl, SENSOR_PAIR *sensor_p[], IMGAG_DATE_INFO *image_date_info) {
 
 	if (ctrl->NUM_PREDICTIONS == 0) {
 		cout << "No Coarse image input for Prediction" << endl;
@@ -2689,7 +3308,12 @@ int PSRFM::check_input_parameters(CONTROL_PARAMETER *ctrl, IMGAG_DATE_INFO *imag
 		}
 	}
 
-
+	if (!ctrl->CLUSTER_METHOD.compare("DONE")) {
+		if (sensor_p[0]->fimage.cfname == "" || sensor_p[1]->fimage.cfname == "") {
+			cout << "Cluster method DONE but missing cluster input files." << endl;
+			return 1;
+		}
+	}
 
 	return 0;
 }
@@ -2859,7 +3483,7 @@ void PSRFM::co_register(short ***ifdata, short ***icdata, short ***ocdata, CONTR
 	}
 
 	// get number of cores and use all but minus 1
-	int numCores = omp_get_num_procs();
+	int numCores = omp_get_num_procs(); //ctrl->NUM_CORES
 	numCores--;
 
 	// locate the indces of coarse data which gives the maximun correlation

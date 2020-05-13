@@ -5,7 +5,7 @@
     <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <LocalDebuggerCommandArguments>C:\PSRFM\psrfm\x64\Release\psrfm.txt</LocalDebuggerCommandArguments>
+    <LocalDebuggerCommandArguments>C:\PSRFM\psrfm\x64\Release\ctrlFile.txt</LocalDebuggerCommandArguments>
     <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
   </PropertyGroup>
 </Project>
