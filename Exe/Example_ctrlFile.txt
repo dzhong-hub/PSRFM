@@ -1,0 +1,65 @@
+PSRFM_PARAMETER_START
+# number of input pairs of fine and coarse resolution image
+  NUM_IN_PAIRS = 2
+# input coarse resolution images (saved in 2 bytes (int16) / pixel)
+  IN_PAIR_COARSE_FNAME = E:\Najib\Input\MCD43A4_175_23-Jun-2016.dat E:\Najib\Input\MCD43A4_215_02-Aug-2016.dat
+# option for co-registration (YES|NO)
+  CO_REGISTER = NO
+# input fine resolution images (saved in 2 bytes (int16) / pixel)
+  IN_PAIR_FINE_FNAME = E:\Najib\Input\S2\S2_172_20-Jun-2016.dat E:\Najib\Input\S2\S2_215_02-Aug-2016.dat
+# input cloud mask images for both fine resolution images (saved in 1 bytes (int8) / pixel)
+  IN_PAIR_FINE_MASK_FNAME = E:\Najib\Input\S2\S2_MASK_172_20-Jun-2016.dat E:\Najib\Input\S2\S2_MASK_215_02-Aug-2016.dat
+# input cluster images (saved in 1 bytes (int8) / pixel)
+  IN_PAIR_CLUSTER_FNAME = NONE
+# coarse resolution images list for prediction days
+  IN_PDAY_COARSE_NO = 3
+  E:\Najib\Input\MCD43A4_211_29-Jul-2016.dat
+  E:\Najib\Input\MCD43A4_212_30-Jul-2016.dat E:\Najib\Input\S2\S2_212_30-Jul-2016.dat
+  E:\Najib\Input\MCD43A4_212_31-Jul-2016.dat
+# output folder for predicted fine resolution images
+  OUT_PREDICTION_DIR = E:\Najib\Output
+# temperary data folder
+  OUT_TEMP_DIR = E:\Najib\Temp
+# ENVI header file for predicted fine resolution images
+  OUT_ENVI_HDR = E:\Najib\Input\S2\S2_212_30-Jul-2016.hdr
+# invalid or fill value for output
+  OUT_FILL = -9999
+# number of rows of input fine and coarse images, for coregistration COARSE_ROWS > NROWS, otherwise they are equal
+  NROWS = 3000
+  COARSE_ROWS = 3000
+# number of colums of input fine and coarse images, for coregistration COARSE_COLS > NCOLS, otherwise they are equal
+  NCOLS = 3000
+  COARSE_COLS = 3000
+# number of bands (same for all inputs)
+  NBANDS = 6
+# spatial resolution (same for all inputs)
+  RESOLUTION = 10
+# resolution ratio of coarse and fine images)
+  BLOCK_SIZE = 50
+# define data scale factor
+  SCALE_FACTOR = 10000
+# define metadata for fine resolution images
+  FINE_IMAGE_FILLV = -9999
+  FINE_IMAGE_DATA_RANGE = 0, 10000
+  FINE_IMAGE_UNCERTAINTY = 40
+# define metadata for coarse resolution images
+  COARSE_IMAGE_FILLV = 32767
+  COARSE_IMAGE_DATA_RANGE = 0, 10000
+  COARSE_IMAGE_UNCERTAINTY = 20
+# cluster method (KMEAN|CRATIO) and input data
+  CLUSTER_METHOD = KMEAN
+  CLUSTER_DATA = fine
+  CLUSTER_RANGE = 10 10
+  CLUSTER_OPTIMAL = CF
+# prediction model
+  PREDICT_MODEL = KFRFM
+# forward and backward merge method (temporal|uncertainty)
+  MERGE_METHOD = temporal
+# residual correction method
+  RC_METHOD = none
+# option for merging fine image on prediction date if available (YES|NO)
+  MERGE_FINE = YES
+  MERGE_THRESHOLD = 200
+  MERGE_EXTENSION = 5
+PSRFM_PARAMETER_END
+
